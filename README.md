@@ -213,6 +213,43 @@ Example of IR code for `mov ah, al` x86 instruction:
 00000000.04      OR          V_01:32,          V_03:32,         R_EAX:32
 ```
 
+Many operating systems uses `FS` segment register to access certain system structures. OpenREIL represents this segment register as `R_FS_BASE:32`. Here is an example of function that gets `_PEB` address of the current Windows process:
+
+```cpp
+ULONG_PTR get_peb(void)
+{
+#ifdef _X86_
+
+    return __readfsdword(0x30);
+
+#else _AMD64_
+
+    return __readgsqword(0x60);
+
+#endif
+}
+```
+
+And IR code of this function:
+
+```
+;
+; asm: mov eax, dword ptr fs:[0x30]
+; data (6): 64 a1 30 00 00 00
+;
+00401000.00     ADD     R_FS_BASE:32,            30:32,          V_04:32
+00401000.01      OR          V_04:32,             0:64,          V_05:64
+00401000.02     AND          V_05:64,      ffffffff:32,          V_10:32
+00401000.03     LDM          V_10:32,                 ,         R_EAX:32
+;
+; asm: ret
+; data (1): c3
+;
+00401006.00     LDM         R_ESP:32,                 ,          V_01:32
+00401006.01     ADD         R_ESP:32,             4:32,         R_ESP:32
+00401006.02     JCC              1:1,                 ,          V_01:32
+```
+
 
 ### Representation of x86 EFLAGS <a id="_3_4"></a>
 
@@ -594,7 +631,7 @@ This record stores the following IR instruction:
 41414141.00     STR          V_00:32,                 ,          V_01:32
 ```
 
-MongoDB module uses `[('addr', ASCENDING), ('inum', ASCENDING)]` as collection index. To improve storage performance you also can join a several instances of MongoDB into the cluster.
+MongoDB module uses `[('addr', ASCENDING), ('inum', ASCENDING)]` as collection index. To improve storage performance you also can join several instances of MongoDB into cluster.
 
 
 ### Translating of basic blocks and functions <a id="_5_4"></a>

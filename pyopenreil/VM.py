@@ -270,7 +270,7 @@ class Math(object):
         eval_u = lambda fn: fn(self.val_u(a), self.val_u(b)).item()
         eval_s = lambda fn: fn(self.val_s(a), self.val_s(b)).item()        
 
-        return { 
+        ret = { 
 
             I_STR: lambda: a.get_val(),            
             I_ADD: lambda: eval_u(lambda a, b: a +  b ),
@@ -293,6 +293,14 @@ class Math(object):
 
         }[op]()
 
+        # hack for one bit arguments
+        if (a is None or a.size == U1) and \
+           (b is None or b.size == U1):
+
+            ret &= 1
+
+        return ret
+
 
 class TestMath(unittest.TestCase):
 
@@ -303,13 +311,34 @@ class TestMath(unittest.TestCase):
 
 class Reg(object):
 
-    def __init__(self, name, val, is_temp = False):
+    def __init__(self, size, val, name = None, temp = False):
 
-        self.name, self.val, self.is_temp = name, val, is_temp
+        self.size, self.val, self.name, self.temp = size, val, name, temp
+
+    def __str__(self):
+
+        return self.name if self.name is not None \
+                         else '%.16x' % self.get_val()
+
+    def get_val(self, val = None):
+
+        val = self.val if val is None else val
+        mkval = lambda mask: long(val & mask)
+
+        if self.size == U1: return 0 if mkval(0x1) == 0 else 1
+        elif self.size == U8:  return mkval(0xff)
+        elif self.size == U16: return mkval(0xffff)
+        elif self.size == U32: return mkval(0xffffffff)
+        elif self.size == U64: return mkval(0xffffffffffffffff)
+
+    def str_val(self, val = None):
+
+        return hex(self.get_val() if val is None else val)
 
 
 class Cpu(object):
 
+    DEF_REG = Reg
     DEF_REG_VAL = 0L
 
     def __init__(self, arch, mem = None, math = None):
@@ -325,12 +354,18 @@ class Cpu(object):
 
     def reset(self, regs = None, mem = None):
 
+        self.regs = {}        
+
+        if self.arch == x86:
+
+            # By default DF is zero, so we need to set R_DFLAG to 1
+            # for indexes auto-incrementing (ffffffffh is used when DF == 1).
+            self.reg('R_DFLAG', val = 1)
+
         if regs is not None:
 
             # set up caller specified registers set
-            for name, val in regs.items(): self.reg(name, val = val)
-
-        else: self.regs = {}
+            for name, val in regs.items(): self.reg(name, val = val)        
 
         if mem is not None:
 
@@ -340,19 +375,35 @@ class Cpu(object):
 
         for name, reg in self.regs.items():
 
-            if reg.is_temp: self.regs.pop(name)
+            if reg.temp: self.regs.pop(name)
 
-    def reg(self, name, val = DEF_REG_VAL, is_temp = False):
+    def reg(self, name, val = None):
 
-        name = name.upper()
+        if isinstance(name, Arg):
+
+            assert not name.type in [ A_NONE, A_CONST ]
+
+            # find register by instruction argument
+            size = name.size
+            temp = name.type == A_TEMP
+            name = name.name                  
+
+        else:
+
+            # find register by name
+            size = self.arch.size            
+            temp = False
+
+        val = self.DEF_REG_VAL if val is None else val
+
         if not name[:2] in [ 'R_', 'V_' ]:
 
             # make canonical register name
-            name = '%s_%s' % ( 'V' if is_temp else 'R', name )
+            name = '%s_%s' % ( 'V' if temp else 'R', name.upper() )
 
         if not self.regs.has_key(name): 
 
-            reg = self.regs[name] = Reg(name, val, is_temp = is_temp)
+            reg = self.regs[name] = self.DEF_REG(size, val, name = name, temp = temp)
 
         else: 
 
@@ -362,25 +413,17 @@ class Cpu(object):
 
     def arg(self, arg):
 
-        if arg.type == A_REG: 
-
-            return Arg(A_CONST, arg.size, val = self.reg(arg.name).val)
-        
-        if arg.type == A_TEMP: 
-
-            return Arg(A_CONST, arg.size, val = self.reg(arg.name, is_temp = True).val)
-
-        if arg.type == A_CONST: 
-
-            return arg
-
         if arg.type == A_NONE: 
 
             return None
 
-    def evaluate(self, op, size, a, b):
+        elif arg.type in [ A_REG, A_TEMP ]: 
 
-        return Arg(A_CONST, size, val = self.math.eval(op, a, b))
+            return self.reg(arg)
+
+        elif arg.type == A_CONST: 
+
+            return self.DEF_REG(arg.size, arg.val)
 
     def insn_none(self, insn, a, b, c):
 
@@ -400,16 +443,16 @@ class Cpu(object):
     def insn_ldm(self, insn, a, b, c):
 
         # read from memory to c
-        self.reg(insn.c.name).val = self.mem.load(a.get_val(), insn.c.size)
+        self.reg(insn.c).val = self.mem.load(a.get_val(), insn.c.size)
         return None
 
     def insn_other(self, insn, a, b, c):
 
         # evaluate all other instructions
-        self.reg(insn.c.name).val = self.evaluate(insn.op, insn.c.size, a, b).get_val()        
+        self.reg(insn.c).val = self.math.eval(insn.op, a, b)      
         return None
 
-    def execute(self, insn):
+    def execute(self, insn):        
 
         # get arguments values
         a, b, c = self.arg(insn.a), self.arg(insn.b), self.arg(insn.c)
@@ -480,12 +523,12 @@ class Cpu(object):
 
     def dump(self, show_flags = True, show_temp = False):
 
-        # dump main registers
+        # dump general purpose registers
         for name, reg in self.regs.items():
 
-            if name in self.arch.Registers.general:
+            if name in [ self.arch.Registers.ip ] + list(self.arch.Registers.general):
 
-                print '%8s: %.16x' % (name, reg.val)
+                print '%8s: %s' % (name, reg.str_val())
 
         if show_flags:
 
@@ -494,16 +537,16 @@ class Cpu(object):
 
                 if name in self.arch.Registers.flags:
 
-                    print '%8s: %.16x' % (name, reg.val)
+                    print '%8s: %s' % (name, reg.str_val())
 
         if show_temp:
 
             # dump temp registers
             for reg in self.regs.values():
 
-                if reg.is_temp:
+                if reg.temp:
 
-                    print '%8s: %.16x' % (reg.name, reg.val)
+                    print '%8s: %s' % (reg.name, reg.str_val())
 
     def dump_mem(self, addr, size): 
 
@@ -643,13 +686,13 @@ class Abi(object):
 
     DUMMY_RET_ADDR = 0xcafebabe;
 
-    def __init__(self, cpu, storage):
+    def __init__(self, cpu, storage, no_reset = False):
 
         self.cpu = cpu
         self.mem, self.arch = cpu.mem, cpu.arch
         self.storage = storage
 
-        self.reset()
+        if not no_reset: self.reset()
 
     def align(self, val):
 
