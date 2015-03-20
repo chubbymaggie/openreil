@@ -179,8 +179,8 @@ $ sudo easy_install cachetools
 <p>You also can download compiled Win32 binaries of OpenREIL:</p>
 
 <ul>
-<li><a href="https://github.com/Cr4sh/openreil/releases/download/0.1/libopenreil-0.1-win32.zip">libopenreil-0.1-win32.zip</a></li>
-<li><a href="https://github.com/Cr4sh/openreil/releases/download/0.1/pyopenreil-0.1-win32-python2.7.zip">pyopenreil-0.1-win32-python2.7.zip</a></li>
+<li><a href="https://github.com/Cr4sh/openreil/releases/download/0.1.1/libopenreil-0.1.1-win32.zip">libopenreil-0.1.1-win32.zip</a></li>
+<li><a href="https://github.com/Cr4sh/openreil/releases/download/0.1.1/pyopenreil-0.1.1-win32-python2.7.zip">pyopenreil-0.1.1-win32-python2.7.zip</a></li>
 </ul>
 
 <h2>
@@ -533,6 +533,26 @@ $ sudo easy_install cachetools
 00000000.2a     STM          V_38:32,                 ,          V_01:32
 </code></pre>
 
+<p>Also, as you can see from IR code above, OpenREIL uses 32-bit <code>R_DFLAG</code> register to represent <a href="http://en.wikipedia.org/wiki/Direction_flag">direction flag</a> of x86. This register is used in such instructions like <code>movsb</code>, <code>lodsb</code>, etc. as increment value for source/destination index, so, <code>R_DFLAG</code> must be <code>1:32</code> when direction flag is not set, and <code>ffffffff:32</code> (minus one) when it's set.</p>
+
+<p>Example of IR code for instruction that clears direction flag:</p>
+
+<pre><code>;
+; asm: cld
+; data (1): fc
+;
+00000000.00     STR             1:32,                 ,       R_DFLAG:32
+</code></pre>
+
+<p>... and for instruction that sets direction flag:</p>
+
+<pre><code>;
+; asm: std
+; data (1): fd
+;
+00000001.00     STR      ffffffff:32,                 ,       R_DFLAG:32
+</code></pre>
+
 <h2>
 <a id="user-content-c-api-" class="anchor" href="#c-api-" aria-hidden="true"><span class="octicon octicon-link"></span></a>C API <a id="user-content-_4"></a>
 </h2>
@@ -813,7 +833,7 @@ storage.clear()</pre></div>
 <pre><code>41414141.00     STR          V_00:32,                 ,          V_01:32
 </code></pre>
 
-<p>MongoDB module uses <code>[('addr', ASCENDING), ('inum', ASCENDING)]</code> as collection index. To improve storage performance you also can join a several instances of MongoDB into the cluster.</p>
+<p>MongoDB module uses <code>[('addr', ASCENDING), ('inum', ASCENDING)]</code> as collection index. To improve storage performance you also can join several instances of MongoDB into cluster.</p>
 
 <h3>
 <a id="user-content-translating-of-basic-blocks-and-functions-" class="anchor" href="#translating-of-basic-blocks-and-functions-" aria-hidden="true"><span class="octicon octicon-link"></span></a>Translating of basic blocks and functions <a id="user-content-_5_4"></a>
@@ -938,7 +958,7 @@ exp_eip <span class="pl-k">=</span> sym.query(SymIP())
 <span class="pl-k">assert</span> exp_zf <span class="pl-k">==</span> SymExp(I_EQ, SymVal(<span class="pl-s1"><span class="pl-pds">'</span>R_ECX<span class="pl-pds">'</span></span>), SymAny())
 <span class="pl-k">assert</span> exp_zf <span class="pl-k">==</span> SymAny()</pre></div>
 
-<p>For extracting information about input and output arguments of <code>symbolic.SymState</code> it has <code>arg_src()</code> and <code>arg_dst()</code> methods:</p>
+<p>For extracting information about input and output arguments of <code>symbolic.SymState</code> it has <code>arg_in()</code> and <code>arg_out()</code> methods:</p>
 
 <div class="highlight highlight-python"><pre><span class="pl-k">print</span> <span class="pl-s1"><span class="pl-pds">'</span>IN:<span class="pl-pds">'</span></span>, <span class="pl-s1"><span class="pl-pds">'</span>, <span class="pl-pds">'</span></span>.join(<span class="pl-s3">map</span>(<span class="pl-st">lambda</span> <span class="pl-vpf">a</span>: <span class="pl-s3">str</span>(a), sym.arg_in()))
 <span class="pl-k">print</span> <span class="pl-s1"><span class="pl-pds">'</span>OUT:<span class="pl-pds">'</span></span>, <span class="pl-s1"><span class="pl-pds">'</span>, <span class="pl-pds">'</span></span>.join(<span class="pl-s3">map</span>(<span class="pl-st">lambda</span> <span class="pl-vpf">a</span>: <span class="pl-s3">str</span>(a), sym.arg_out()))</pre></div>
@@ -1031,7 +1051,7 @@ cfg <span class="pl-k">=</span> CFGraphBuilder(tr).traverse(addr)</pre></div>
 
 <div class="highlight highlight-python"><pre>cfg.to_dot_file(<span class="pl-s1"><span class="pl-pds">'</span>cfg.dot<span class="pl-pds">'</span></span>)</pre></div>
 
-<p>Than you can render this file into the PNG image using Graphviz dot utility:</p>
+<p>Then you can render this file into the PNG image using Graphviz dot utility:</p>
 
 <pre><code>$ dot -Tpng cfg.dot &gt; cfg.png
 </code></pre>

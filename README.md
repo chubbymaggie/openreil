@@ -101,8 +101,8 @@ Building OpenREIL on Windows requires [MinGW](http://www.mingw.org/) build envir
 
 You also can download compiled Win32 binaries of OpenREIL:
 
-* [libopenreil-0.1-win32.zip](https://github.com/Cr4sh/openreil/releases/download/0.1/libopenreil-0.1-win32.zip)
-* [pyopenreil-0.1-win32-python2.7.zip](https://github.com/Cr4sh/openreil/releases/download/0.1/pyopenreil-0.1-win32-python2.7.zip)
+* [libopenreil-0.1.1-win32.zip](https://github.com/Cr4sh/openreil/releases/download/0.1.1/libopenreil-0.1.1-win32.zip)
+* [pyopenreil-0.1.1-win32-python2.7.zip](https://github.com/Cr4sh/openreil/releases/download/0.1.1/pyopenreil-0.1.1-win32-python2.7.zip)
 
 
 ## IR format  <a id="_3"></a>
@@ -342,6 +342,28 @@ Example of IR code for pushfd x86 instruction:
 00000000.28     AND          V_36:32,         40000:32,          V_37:32
 00000000.29      OR          V_33:32,          V_37:32,          V_38:32
 00000000.2a     STM          V_38:32,                 ,          V_01:32
+```
+
+Also, as you can see from IR code above, OpenREIL uses 32-bit `R_DFLAG` register to represent [direction flag](http://en.wikipedia.org/wiki/Direction_flag) of x86. This register is used in such instructions like `movsb`, `lodsb`, etc. as increment value for source/destination index, so, `R_DFLAG` must be `1:32` when direction flag is not set, and `ffffffff:32` (minus one) when it's set.
+
+Example of IR code for instruction that clears direction flag:
+
+```
+;
+; asm: cld
+; data (1): fc
+;
+00000000.00     STR             1:32,                 ,       R_DFLAG:32
+```
+
+... and for instruction that sets direction flag:
+
+```
+;
+; asm: std
+; data (1): fd
+;
+00000001.00     STR      ffffffff:32,                 ,       R_DFLAG:32
 ```
 
 ## C API <a id="_4"></a>
@@ -766,7 +788,7 @@ assert exp_zf == SymExp(I_EQ, SymVal('R_ECX'), SymAny())
 assert exp_zf == SymAny()
 ```
 
-For extracting information about input and output arguments of `symbolic.SymState` it has `arg_src()` and `arg_dst()` methods:
+For extracting information about input and output arguments of `symbolic.SymState` it has `arg_in()` and `arg_out()` methods:
 
 ```python
 print 'IN:', ', '.join(map(lambda a: str(a), sym.arg_in()))
@@ -868,7 +890,7 @@ You can save generated graph as file of [Graphviz DOT format](http://www.graphvi
 cfg.to_dot_file('cfg.dot')
 ```
 
-Than you can render this file into the PNG image using Graphviz dot utility:
+Then you can render this file into the PNG image using Graphviz dot utility:
 
 ```
 $ dot -Tpng cfg.dot > cfg.png
