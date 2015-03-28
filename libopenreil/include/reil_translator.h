@@ -1,6 +1,8 @@
 
-#ifndef _REIL_TRANSLATOR_H_
-#define _REIL_TRANSLATOR_H_
+#ifndef REIL_TRANSLATOR_H
+#define REIL_TRANSLATOR_H
+
+#define EXPAND_EFLAGS
 
 #define MAX_REG_NAME_LEN 20
 
@@ -96,5 +98,4 @@ private:
     CReilFromBilTranslator *translator;
 };
 
-#endif
-
+#endif // REIL_TRANSLATOR_H
