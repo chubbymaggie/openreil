@@ -1,11 +1,29 @@
 cimport libopenreil
 
 ARCH_X86 = 0
+ARCH_ARM = 1
 
 # IR instruction attributes
 IATTR_ASM = 0
 IATTR_BIN = 1
 IATTR_FLAGS = 2
+
+LOG_INFO = 0x00000001 # regular message
+LOG_WARN = 0x00000002 # error
+LOG_ERR = 0x00000004 # warning
+LOG_BIN = 0x00000008 # instruction bytes
+LOG_ASM = 0x00000010 # instruction assembly code
+LOG_VEX = 0x00000020 # instruction VEX code
+LOG_BIL = 0x00000040 # instruction BAP IL code
+
+# all log messages mask
+LOG_ALL = 0x7FFFFFFF
+
+# disable log messages mask
+LOG_NONE = 0
+
+# default log messages mask
+LOG_MASK_DEFAULT = LOG_INFO | LOG_WARN | LOG_ERR
 
 cdef process_arg(libopenreil._reil_arg_t arg):
 
@@ -75,6 +93,11 @@ class Error(Exception):
         return self.msg
 
 
+class InitError(Error):
+
+    pass
+
+
 class TranslationError(Error):
 
     def __init__(self, addr):
@@ -89,30 +112,48 @@ class TranslationError(Error):
 cdef class Translator:
 
     cdef libopenreil.reil_t reil
-    cdef libopenreil.reil_arch_t reil_arch
+    cdef libopenreil.reil_arch_t reil_arch 
+    cdef char* log_path   
     translated = []
 
-    def __init__(self, arch):
+    def __init__(self, arch, log_path = None, log_mask = LOG_MASK_DEFAULT):
     
         self.reil_arch = self.get_reil_arch(arch)
+        
+        if log_path is None:
+        
+            self.log_path = NULL
+
+        else:
+        
+            self.log_path = log_path
+
+        # initialize logging
+        libopenreil.reil_log_init(log_mask, self.log_path)
 
         # initialize translator
         self.reil = libopenreil.reil_init(self.reil_arch, 
             <libopenreil.reil_inst_handler_t>process_insn, <void*>self.translated)
 
+        if self.reil == NULL:
+
+            raise InitError('Error while initializing REIL translator')
+
     def __del__(self):
 
         libopenreil.reil_close(self.reil)
+        libopenreil.reil_log_close()
 
     def get_reil_arch(self, arch):
 
         try: 
 
-            return { ARCH_X86: libopenreil.ARCH_X86 }[ arch ]
+            return { ARCH_X86: libopenreil.ARCH_X86, 
+                     ARCH_ARM: libopenreil.ARCH_ARM }[ arch ]
 
         except KeyError: 
 
-            raise Error('Unknown architecture')
+            raise InitError('Unknown architecture')
 
     def to_reil(self, data, addr = 0):
 

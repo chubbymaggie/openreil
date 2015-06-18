@@ -199,6 +199,28 @@ class SymConst(Sym):
         return hash(self.val)
 
 
+class SymIRAddr(Sym):
+
+    def __init__(self, addr, inum):
+
+        self.addr, self.inum = addr, inum
+
+    def __str__(self):
+
+        return '%.8x.%.2x' % (self.addr, self.inum)
+
+    def __eq__(self, other):
+
+        if type(other) == SymAny: return True
+        if type(other) != SymIRAddr: return False
+
+        return self.addr == other.addr and self.inum == other.inum
+
+    def __hash__(self):
+
+        return hash(self.addr) ^ hash(self.inum)
+
+
 class SymIP(Sym):
 
     def __str__(self):
@@ -379,10 +401,21 @@ class SymState(object):
             # clear state
             self.state = []
 
+    def get(self, val):
+
+        try: 
+
+            return self[val]
+
+        except KeyError: 
+
+            return None
+
     def query(self, val):
 
-        try: return self[val]
-        except KeyError: return val        
+        ret = self.get(val)
+
+        return val if ret is None else ret 
 
     def arg_in(self):
 

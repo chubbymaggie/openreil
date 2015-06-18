@@ -2,17 +2,17 @@
 #include <vector>
 #include <iostream>
 #include <stdio.h>
+#include <string.h>
 #include <assert.h>
 
+using namespace std;
+
 #include "irtoir-internal.h"
-#include "config.h"
+#include "disasm.h"
 
 #if VEX_VERSION >= 1793
 #define Ist_MFence Ist_MBE
 #endif
-
-// flag to disable warnings (for unit test's sake)
-bool print_warnings = 1;
 
 // enable/disable lazy eflags computation.
 // this is for transitional purposes, and should be removed soon.
@@ -22,51 +22,22 @@ bool use_eflags_thunks = 0;
 bool use_simple_segments = 1;
 bool translate_calls_and_returns = 0;
 
-// Guest architecture we are translating from.
-// Set in generate_bap_ir, accessed all over...
-// It might be cleaner to pass this around, but that would require a lot of
-// refactoring.
-VexArch guest_arch = VexArch_INVALID;
-
-using namespace std;
-
-#include "disasm.h"
-
 //
 // For labeling untranslated VEX IR instructions
 //
 string uTag = "Unknown: ";
 string sTag = "Skipped: ";
 
-//
-// Special Exp to record the AST for shl, shr
-//
-Exp *count_opnd = NULL;
 
 //======================================================================
 // Forward declarations
 //======================================================================
 Exp *emit_mux0x(vector<Stmt *> *irout, reg_t type, Exp *cond, Exp *exp0, Exp *expX);
-void modify_flags(bap_block_t *block);
-static void insert_specials(bap_block_t *block);
-void do_cleanups_before_processing();
+void insert_specials(bap_context_t *context, bap_block_t *block);
+void track_flag_thunks(bap_context_t *context, bap_block_t *block);
+void modify_flags(bap_context_t *context, bap_block_t *block);
+void do_cleanups_before_processing(bap_context_t *context);
 
-
-//======================================================================
-//
-// Helper functions for output (generally should only be used by automated
-// testing)
-//
-//======================================================================
-void asmir_set_print_warning(bool value)
-{
-    print_warnings = value;
-}
-
-bool asmir_get_print_warning()
-{
-    return print_warnings;
-}
 
 //======================================================================
 //
@@ -95,28 +66,436 @@ bool get_use_eflags_thunks()
 
 void set_call_return_translation(int value)
 {
-    cerr << "Warning: set_call_return_translation() is deprecated. Use replace_calls_and_returns instead.\n";
-    translate_calls_and_returns = (bool) value;
+    translate_calls_and_returns = (bool)value;
 }
 
-//----------------------------------------------------------------------
-// A panic function that prints a msg and terminates the program
-//----------------------------------------------------------------------
-void panic(string msg)
+//
+// This function CONSUMES the cond and flag expressions passed in, i.e.
+// they are not cloned before use.
+//
+void set_flag(vector<Stmt *> *irout, reg_t type, Temp *flag, Exp *cond)
 {
-    ostringstream os;
+    // set flag directly to condition
+    //    irout->push_back( new Move(flag, emit_mux0x(irout, type, cond, ex_const(0), ex_const(1))) );
+    irout->push_back(new Move(flag, cond));
+}
 
-    os << "Panic: " << msg;    
-    throw os.str().c_str();
+void modify_eflags_helper(bap_context_t *context, string op, reg_t type, vector<Stmt *> *ir, int argnum, Mod_Func_0 *mod_eflags_func)
+{
+    assert(ir);
+    assert(argnum == 2 || argnum == 3);
+    assert(mod_eflags_func);
+
+    // Look for occurrence of CC_OP assignment
+    // These will have the indices of the CC_OP stmts
+    int opi, dep1, dep2, ndep, mux0x;
+    opi = dep1 = dep2 = ndep = mux0x = -1;
+    get_thunk_index(ir, &opi, &dep1, &dep2, &ndep, &mux0x);
+
+    if (opi >= 0)
+    {
+        vector<Stmt *> mods;
+
+        if (argnum == 2)
+        {
+            // Get the arguments we need from these Stmt's
+            Exp *arg1 = ((Move *)(ir->at(dep1)))->rhs;
+            Exp *arg2 = ((Move *)(ir->at(dep2)))->rhs;
+
+            // Do the translation
+            // To figure out the type, we assume the rhs of the
+            // assignment to CC_DEP is always either a Constant or a Temp
+            // Otherwise, we have no way of figuring out the expression type
+            Mod_Func_2 *mod_func = (Mod_Func_2 *)mod_eflags_func;
+            mods = mod_func(context, type, arg1, arg2);
+        }
+        else // argnum == 3
+        {
+            Exp *arg1 = ((Move *)(ir->at(dep1)))->rhs;
+            Exp *arg2 = ((Move *)(ir->at(dep2)))->rhs;
+            Exp *arg3 = ((Move *)(ir->at(ndep)))->rhs;
+
+            Mod_Func_3 *mod_func = (Mod_Func_3 *)mod_eflags_func;
+            mods = mod_func(context, type, arg1, arg2, arg3);
+        }
+
+        // Delete the thunk
+        int pos = del_put_thunk(ir, op, opi, dep1, dep2, ndep, mux0x);
+        
+        // Insert the eflags mods in this position
+        ir->insert(ir->begin() + pos, mods.begin(), mods.end());
+        ir->insert(ir->begin() + pos, new Comment("eflags thunk: " + op));
+    }
+    else
+    {
+        log_write(LOG_WARN, "No EFLAGS thunk was found for \"%s\"!", op.c_str());
+    }
+}
+
+void del_seg_selector_trash(bap_block_t *block)
+{
+    assert(block);
+
+    vector<Stmt *> rv;
+    vector<Stmt *> *ir = block->bap_ir;
+
+    bool use_seg_selector_found = false;
+    
+    // Look for junk code after the eliminated x86g_use_seg_selector VEX call
+    for (int i = 0; i < ir->size(); i++)
+    {
+        Stmt *stmt = ir->at(i);
+        rv.push_back(stmt);
+
+        if (i == 0 || i >= ir->size() - 3)
+        {
+            continue;
+        }
+
+        Stmt *prev = ir->at(i - 1);
+
+        // Check for x86g_use_seg_selector comment statement
+        if ((stmt->stmt_type == MOVE && ((Move *)stmt)->lhs->exp_type == TEMP) &&
+            (prev->stmt_type == COMMENT && ((Comment *)prev)->comment == "x86g_use_seg_selector"))
+        {         
+            Temp *seg_addr = (Temp *)((Move *)stmt)->lhs;
+
+            Stmt *next_1 = ir->at(i + 1);
+            Stmt *next_2 = ir->at(i + 2);
+            Stmt *next_3 = ir->at(i + 3);
+
+            /*
+                Find assert() statement that checks virtual address after the
+                x86g_use_seg_selector VEX call, this code was generated by libVEX 
+                and translated by libasmir.
+
+                VEX IR example:
+
+                    t6 = GET:I16(294)
+                    t5 = 16Uto32(t6)
+                    t1 = GET:I32(300)
+                    t2 = GET:I32(304)
+                    t7 = GET:I32(8)
+                    t8 = x86g_use_seg_selector{0xa6ab8540}(t1,t2,t5,t7):I64
+                    t10 = 64HIto32(t8)
+                    t9 = CmpNE32(t10,0x0:I32)
+                    if (t9) { PUT(68) = 0x1337:I32; exit-MapFail }
+                    ...
+
+                Generated BAP IR:
+
+                    T_16t6:reg16_t = R_FS:reg16_t;
+                    T_32t5:reg32_t = cast(T_16t6:reg16_t)U:reg32_t;
+                    T_32t1:reg32_t = R_LDT:reg32_t;
+                    T_32t2:reg32_t = R_GDT:reg32_t;
+                    T_32t7:reg32_t = R_EAX:reg32_t;
+                    // x86g_use_seg_selector
+                    T_64t8:reg64_t = cast((R_FS_BASE:reg32_t+T_32t7:reg32_t))U:reg64_t;
+                    T_32t10:reg32_t = cast(T_64t8:reg64_t)H:reg32_t;
+                    T_1t9:reg1_t = (T_32t10:reg32_t<>0:reg32_t);
+                    assert((!T_1t9:reg1_t));
+                    ...
+            */
+            if ((next_3->stmt_type == ASSERT && ((Assert *)next_3)->cond->exp_type == UNOP) && 
+
+                (next_2->stmt_type == MOVE && ((Move *)next_2)->rhs->exp_type == BINOP &&
+                                              ((Move *)next_2)->lhs->exp_type == TEMP) &&
+
+                (next_1->stmt_type == MOVE && ((Move *)next_1)->rhs->exp_type == CAST && 
+                                              ((Move *)next_1)->lhs->exp_type == TEMP))
+            {
+                // Get 1-st statement arguments
+                Cast *cast = (Cast *)((Move *)next_1)->rhs;                
+                Temp *temp_1 = (Temp *)((Move *)next_1)->lhs;
+
+                // Get 2-nd statement arguments
+                BinOp *binop = (BinOp *)((Move *)next_2)->rhs;
+                Temp *temp_2 = (Temp *)((Move *)next_2)->lhs;
+
+                // Get assert argument
+                UnOp *unop = (UnOp *)((Assert *)next_3)->cond;
+
+                /*
+                    Here goes some argument checks to be sure that we will 
+                    not break a dataflow graph of translated instruction
+                    during junk code deletion.
+                */
+                Exp *arg_1_1 = (Exp *)cast->exp;
+                Exp *arg_2_1 = (Exp *)binop->lhs;
+                Exp *arg_2_2 = (Exp *)binop->rhs;
+                Exp *arg_3_1 = (Exp *)unop->exp;
+
+                // Check for proper expressions
+                if ((cast->cast_type == CAST_HIGH && arg_1_1->exp_type == TEMP) &&
+                    (unop->unop_type == NOT && arg_3_1->exp_type == TEMP) && 
+                    (binop->binop_type == NEQ && arg_2_1->exp_type == TEMP && 
+                                                 arg_2_2->exp_type == CONSTANT))
+                {
+                    // Check for proper expression arguments
+                    if (((Temp *)arg_1_1)->name == seg_addr->name &&
+                        ((Temp *)arg_2_1)->name == temp_1->name && ((Constant *)arg_2_2)->val == 0 &&
+                        ((Temp *)arg_3_1)->name == temp_2->name)                        
+                    {
+                        // Skip next 3 instructions, it's safe to delete them
+                        i += 3;
+                        use_seg_selector_found = true;
+                    }
+                }
+            }                        
+        }        
+    }
+
+    ir->clear();
+    ir->insert(ir->begin(), rv.begin(), rv.end());
+
+    if (!use_seg_selector_found)
+    {
+        // Segment selector access was not found
+        return;
+    }
+    
+    rv.clear();
+
+    // Eliminate GDT and LDT access statements
+    for (int i = 0; i < ir->size(); i++)
+    {
+        Stmt *stmt = ir->at(i);
+        rv.push_back(stmt);
+
+        // Check for move from temp
+        if (stmt->stmt_type == MOVE && ((Move *)stmt)->rhs->exp_type == TEMP)
+        {
+            Temp *temp = (Temp *)((Move *)stmt)->rhs;
+
+            // Check for move from LDT and GDT
+            if (temp->name == "R_LDT" || temp->name == "R_GDT")
+            {
+                // remove and free the statement
+                Stmt::destroy(rv.back());
+                rv.pop_back();
+            }
+        }
+    }
+
+    ir->clear();
+    ir->insert(ir->begin(), rv.begin(), rv.end());
+
+    rv.clear();
+
+    // Eliminate junk REG_32 <-> REG_64 casts
+    for (int i = 0; i < ir->size(); i++)
+    {
+        Stmt *stmt = ir->at(i);
+        rv.push_back(stmt);
+
+        if (i == 0 || i >= ir->size() - 1)
+        {
+            continue;
+        }
+
+        Stmt *prev = ir->at(i - 1);
+        Stmt *next = ir->at(i + 1);        
+
+        // Check for x86g_use_seg_selector comment statement
+        if ((prev->stmt_type == COMMENT && ((Comment *)prev)->comment == "x86g_use_seg_selector") &&
+            
+            (next->stmt_type == MOVE && ((Move *)next)->lhs->exp_type == TEMP
+                                     && ((Move *)next)->rhs->exp_type == CAST) &&
+
+            (stmt->stmt_type == MOVE && ((Move *)stmt)->lhs->exp_type == TEMP
+                                     && ((Move *)stmt)->rhs->exp_type == CAST))
+        {   
+            Temp *temp_1 = (Temp *)((Move *)stmt)->lhs;      
+            Cast *cast_1 = (Cast *)((Move *)stmt)->rhs;
+            Cast *cast_2 = (Cast *)((Move *)next)->rhs;
+
+            // Check for 32 -> 64 -> 32 cast
+            if (cast_1->typ == REG_64 && cast_1->cast_type == CAST_UNSIGNED &&
+                cast_2->typ == REG_32 && cast_2->cast_type == CAST_LOW && 
+                cast_2->exp->exp_type == TEMP)
+            {
+                Temp *temp_2 = (Temp *)cast_2->exp;
+
+                if (temp_1->name == temp_2->name)
+                {
+                    temp_1->typ = REG_32;
+                    temp_2->typ = REG_32;
+
+                    // Remove both of the cast operations
+                    ((Move *)stmt)->rhs = ecl(cast_1->exp);
+                    ((Move *)next)->rhs = ecl(cast_2->exp);                    
+                }                      
+            }
+        }
+    }
+
+    ir->clear();
+    ir->insert(ir->begin(), rv.begin(), rv.end());
+}
+
+void del_get_thunk(bap_block_t *block)
+{
+    assert(block);
+
+    vector<Stmt *> rv;
+    vector<Stmt *> *ir = block->bap_ir;
+    string mnemonic = block->str_mnem;
+
+    if (i386_op_is_very_broken(mnemonic)) 
+    {       
+        return;
+    }
+
+    assert(ir);
+
+    for (vector<Stmt *>::iterator i = ir->begin(); i != ir->end(); i++)
+    {
+        Stmt *stmt = (*i);
+        rv.push_back(stmt);
+
+        if (stmt->stmt_type == MOVE)
+        {
+            Move *move = (Move *)stmt;
+
+            if (move->rhs->exp_type == TEMP)
+            {
+                Temp *temp = (Temp *)(move->rhs);
+
+                if (temp->name.find("CC_OP") != string::npos || 
+                    temp->name.find("CC_DEP1") != string::npos || 
+                    temp->name.find("CC_DEP2") != string::npos || 
+                    temp->name.find("CC_NDEP") != string::npos)
+                {
+                    // remove and free the statement
+                    Stmt::destroy(rv.back());
+                    rv.pop_back();
+                }
+            }
+        }
+    }
+
+    ir->clear();
+    ir->insert(ir->begin(), rv.begin(), rv.end());
+}
+
+int del_put_thunk(vector<Stmt *> *ir, string mnemonic, int opi, int dep1, int dep2, int ndep, int mux0x)
+{
+    assert(ir);
+    assert(opi >= 0 && dep1 >= 0 && dep2 >= 0 && ndep >= 0);
+
+    vector<Stmt *> rv;
+    int ret = -1, len = 0, j = 0;
+
+    // Delete statements assigning to flag thunk temps
+    for (vector<Stmt *>::iterator i = ir->begin(); i != ir->end(); i++, j++)
+    {
+        Stmt *stmt = (*i);
+        rv.push_back(stmt);
+
+        len++;
+
+        if (i386_op_is_very_broken(mnemonic))
+        {
+            // don't touch thunks for some of the broken instructions
+            continue;
+        }
+        
+        // find MOVE statement with TEMP lvar
+        if (stmt->stmt_type == MOVE)
+        {
+            Move *move = (Move *)stmt;
+
+            if (move->lhs->exp_type == TEMP)
+            {
+                Temp *temp = (Temp *)(move->lhs);
+
+                if (temp->name.find("CC_OP") != string::npos || 
+                    temp->name.find("CC_DEP1") != string::npos || 
+                    temp->name.find("CC_DEP2") != string::npos || 
+                    temp->name.find("CC_NDEP") != string::npos)
+                {                        
+                    // CC_OP, CC_DEP1, CC_DEP2, CC_NDEP are never set unless
+                    // use_eflags_thunks is true
+                    if (!use_eflags_thunks)
+                    {
+                        Stmt::destroy(rv.back());
+                        rv.pop_back();
+                        len--;
+                    }                    
+
+		    // remember flag last thunk position
+                    ret = len;
+                }
+            }
+        }
+    }
+
+    assert(len >= 0);
+
+    if (ret == -1)
+    {
+        // no thunks found
+        ret = len;
+    }    
+    
+    ir->clear();
+    ir->insert(ir->begin(), rv.begin(), rv.end());
+    
+    return ret;
+}
+
+void get_thunk_index(vector<Stmt *> *ir, int *op, int *dep1, int *dep2, int *ndep, int *mux0x)
+{
+    assert(ir);
+
+    unsigned int i;
+
+    *op = -1;
+
+    for (i = 0; i < ir->size(); i++)
+    {
+        Stmt *stmt = ir->at(i);
+
+        if (stmt->stmt_type != MOVE || ((Move *)stmt)->lhs->exp_type != TEMP)
+        {
+            continue;
+        }
+
+        Temp *temp = (Temp *)((Move *)stmt)->lhs;
+
+        if (temp->name.find("CC_OP") != string::npos)
+        {
+            *op = i;
+
+            if (match_mux0x(ir, (i - MUX_SUB), NULL, NULL, NULL, NULL) >= 0)
+            {
+                *mux0x = (i - MUX_SUB);
+            }
+        }
+        else if (temp->name.find("CC_DEP1") != string::npos)
+        {
+            *dep1 = i;
+        }
+        else if (temp->name.find("CC_DEP2") != string::npos)
+        {
+            *dep2 = i;
+        }
+        else if (temp->name.find("CC_NDEP") != string::npos)
+        {
+            *ndep = i;
+        }
+    }
 }
 
 //---------------------------------------------------------------------
 // Helper wrappers around arch specific functions
 //---------------------------------------------------------------------
 
-vector<VarDecl *> get_reg_decls(VexArch arch)
+vector<VarDecl *> get_reg_decls(bap_context_t *context)
 {
-    switch (arch)
+    vector<VarDecl *> ret;
+
+    switch (context->guest)
     {
     case VexArchX86:
 
@@ -130,88 +509,92 @@ vector<VarDecl *> get_reg_decls(VexArch arch)
     
         panic("irtoir.cpp: translate_get: unsupported arch");
     }
+
+    return ret;
 }
 
-vector<VarDecl *> get_reg_decls(void)
-{
-    return get_reg_decls(guest_arch);
-}
-
-Exp *translate_get(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_get(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
     assert(irout);
 
-    switch (guest_arch)
+    switch (context->guest)
     {
     case VexArchX86:
     
-        return i386_translate_get(expr, irbb, irout);
+        return i386_translate_get(context, expr, irbb, irout);
     
     case VexArchARM:
     
-        return arm_translate_get(expr, irbb, irout);
+        return arm_translate_get(context, expr, irbb, irout);
     
     default:
     
         panic("irtoir.cpp: translate_get: unsupported arch");
     }
+
+    return NULL;
 }
 
-Stmt *translate_put(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
+Stmt *translate_put(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
 {
-    switch (guest_arch)
+    switch (context->guest)
     {
     case VexArchX86:
     
-        return i386_translate_put(stmt, irbb, irout);
+        return i386_translate_put(context, stmt, irbb, irout);
     
     case VexArchARM:
     
-        return arm_translate_put(stmt, irbb, irout);
+        return arm_translate_put(context, stmt, irbb, irout);
     
     default:
+        
         panic("translate_put");
     }
+
+    return NULL;
 }
 
-Exp *translate_ccall(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_ccall(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
     assert(irout);
 
-    switch (guest_arch)
+    switch (context->guest)
     {
     case VexArchX86:
     
-        return i386_translate_ccall(expr, irbb, irout);
+        return i386_translate_ccall(context, expr, irbb, irout);
     
     case VexArchARM:
     
-        return arm_translate_ccall(expr, irbb, irout);
+        return arm_translate_ccall(context, expr, irbb, irout);
     
     default:
 
         panic("translate_ccall");
     }
+
+    return NULL;
 }
 
-void modify_flags(bap_block_t *block)
+void modify_flags(bap_context_t *context, bap_block_t *block)
 {
     assert(block);
 
-    switch (guest_arch)
+    switch (context->guest)
     {
     case VexArchX86:
     
-        i386_modify_flags(block);
+        i386_modify_flags(context, block);
         break;
     
     case VexArchARM:
     
-        arm_modify_flags(block);
+        arm_modify_flags(context, block);
         break;
     
     default:
@@ -263,27 +646,21 @@ reg_t IRType_to_reg_type(IRType type)
     
     case Ity_F32:
 
-        if (print_warnings)
-        {
-            fprintf(stderr, "WARNING: Float32 register encountered\n");
-        }
-
+        log_write(LOG_WARN, "Float32 register encountered");
         t = REG_32;
+
         break;
     
     case Ity_F64:
 
-        if (print_warnings)
-        {
-            fprintf(stderr, "WARNING: Float64 register encountered\n");
-        }
-
+        log_write(LOG_WARN, "Float64 register encountered");
         t = REG_64;
+
         break;
     
     default:
 
-        throw "Unknown IRType";
+        panic("Unknown IRType");
     }
 
     return t;
@@ -346,7 +723,7 @@ Name *mk_dest_name(Addr64 dest)
 // This function returns a 64 bit expression with arg1 occupying the
 // high 32 bits and arg2 occupying the low 32 bits.
 //----------------------------------------------------------------------
-Exp *translate_32HLto64(Exp *arg1, Exp *arg2)
+Exp *translate_32HLto64(bap_context_t *context, Exp *arg1, Exp *arg2)
 {
     assert(arg1);
     assert(arg2);
@@ -359,7 +736,7 @@ Exp *translate_32HLto64(Exp *arg1, Exp *arg2)
     return new BinOp(BITOR, high, low);
 }
 
-Exp *translate_64HLto64(Exp *high, Exp *low)
+Exp *translate_64HLto64(bap_context_t *context, Exp *high, Exp *low)
 {
     assert(high);
     assert(low);
@@ -371,7 +748,7 @@ Exp *translate_64HLto64(Exp *high, Exp *low)
     return new BinOp(BITOR, high, low);
 }
 
-Exp *translate_DivModU64to32(Exp *arg1, Exp *arg2)
+Exp *translate_DivModU64to32(bap_context_t *context, Exp *arg1, Exp *arg2)
 {
     assert(arg1);
     assert(arg2);
@@ -379,10 +756,10 @@ Exp *translate_DivModU64to32(Exp *arg1, Exp *arg2)
     Exp *div = new BinOp(DIVIDE, arg1, arg2);
     Exp *mod = new BinOp(MOD, ecl(arg1), ecl(arg2));
 
-    return translate_64HLto64(mod, div);
+    return translate_64HLto64(context, mod, div);
 }
 
-Exp *translate_DivModS64to32(Exp *arg1, Exp *arg2)
+Exp *translate_DivModS64to32(bap_context_t *context, Exp *arg1, Exp *arg2)
 {
     assert(arg1);
     assert(arg2);
@@ -390,10 +767,10 @@ Exp *translate_DivModS64to32(Exp *arg1, Exp *arg2)
     Exp *div = new BinOp(SDIVIDE, arg1, arg2);
     Exp *mod = new BinOp(SMOD, ecl(arg1), ecl(arg2));
 
-    return translate_64HLto64(mod, div);
+    return translate_64HLto64(context, mod, div);
 }
 
-Exp *translate_MullS8(Exp *arg1, Exp *arg2)
+Exp *translate_MullS8(bap_context_t *context, Exp *arg1, Exp *arg2)
 {
     assert(arg1);
     assert(arg2);
@@ -404,7 +781,7 @@ Exp *translate_MullS8(Exp *arg1, Exp *arg2)
     return new BinOp(TIMES, wide1, wide2);
 }
 
-Exp *translate_MullU32(Exp *arg1, Exp *arg2)
+Exp *translate_MullU32(bap_context_t *context, Exp *arg1, Exp *arg2)
 {
     assert(arg1);
     assert(arg2);
@@ -415,7 +792,7 @@ Exp *translate_MullU32(Exp *arg1, Exp *arg2)
     return new BinOp(TIMES, wide1, wide2);
 }
 
-Exp *translate_MullS32(Exp *arg1, Exp *arg2)
+Exp *translate_MullS32(bap_context_t *context, Exp *arg1, Exp *arg2)
 {
     assert(arg1);
     assert(arg2);
@@ -426,13 +803,13 @@ Exp *translate_MullS32(Exp *arg1, Exp *arg2)
     return new BinOp(TIMES, wide1, wide2);
 }
 
-Exp *translate_Clz32(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_Clz32(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
     assert(irout);
 
-    Exp *arg = translate_expr(expr->Iex.Unop.arg, irbb, irout);
+    Exp *arg = translate_expr(context, expr->Iex.Unop.arg, irbb, irout);
 
     Temp *counter = mk_temp(Ity_I32, irout);
     Temp *temp = mk_temp(typeOfIRExpr(irbb->tyenv, expr->Iex.Unop.arg), irout);
@@ -456,13 +833,13 @@ Exp *translate_Clz32(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
     return counter;
 }
 
-Exp *translate_Ctz32(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_Ctz32(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
     assert(irout);
 
-    Exp *arg = translate_expr(expr->Iex.Unop.arg, irbb, irout);
+    Exp *arg = translate_expr(context, expr->Iex.Unop.arg, irbb, irout);
 
     Temp *counter = mk_temp(Ity_I32, irout);
     Temp *temp = mk_temp(typeOfIRExpr(irbb->tyenv, expr->Iex.Unop.arg), irout);
@@ -486,14 +863,14 @@ Exp *translate_Ctz32(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
     return counter;
 }
 
-Exp *translate_CmpF64(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_CmpF64(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
     assert(irout);
 
-    Exp *arg1 = translate_expr(expr->Iex.Binop.arg1, irbb, irout);
-    Exp *arg2 = translate_expr(expr->Iex.Binop.arg2, irbb, irout);
+    Exp *arg1 = translate_expr(context, expr->Iex.Binop.arg1, irbb, irout);
+    Exp *arg2 = translate_expr(context, expr->Iex.Binop.arg2, irbb, irout);
 
     Exp *condEQ = new BinOp(EQ, arg1, arg2);
     Exp *condGT = new BinOp(GT, ecl(arg1), ecl(arg2));
@@ -530,7 +907,7 @@ Exp *translate_CmpF64(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
     return temp;
 }
 
-Exp *translate_const(IRExpr *expr)
+Exp *translate_const(bap_context_t *context, IRExpr *expr)
 {
     assert(expr);
 
@@ -596,9 +973,9 @@ Exp *translate_const(IRExpr *expr)
     return result;
 }
 
-Exp *translate_simple_unop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_simple_unop(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
-    Exp *arg = translate_expr(expr->Iex.Unop.arg, irbb, irout);
+    Exp *arg = translate_expr(context, expr->Iex.Unop.arg, irbb, irout);
 
     switch (expr->Iex.Unop.op)
     {
@@ -774,7 +1151,7 @@ Exp *translate_simple_unop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
     return NULL;
 }
 
-Exp *translate_unop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_unop(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(irbb);
     assert(expr);
@@ -782,33 +1159,37 @@ Exp *translate_unop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 
     Exp *result;
 
-    if ((result = translate_simple_unop(expr, irbb, irout)) != NULL)
+    if ((result = translate_simple_unop(context, expr, irbb, irout)) != NULL)
     {
         return result;
     }
 
     switch (expr->Iex.Unop.op)
     {
-
     case Iop_Clz32:
-        return translate_Clz32(expr, irbb, irout);
+        
+        return translate_Clz32(context, expr, irbb, irout);
+
     case Iop_Ctz32:
-        return translate_Ctz32(expr, irbb, irout);
+        
+        return translate_Ctz32(context, expr, irbb, irout);
 
     case Iop_AbsF64:
+        
         return new Unknown("Floating point op", REG_64);
 
     default:
-        throw "Unrecognized unary op";
+        
+        panic("Unrecognized unary op");
     }
 
     return NULL;
 }
 
-Exp *translate_simple_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_simple_binop(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
-    Exp *arg1 = translate_expr(expr->Iex.Binop.arg1, irbb, irout);
-    Exp *arg2 = translate_expr(expr->Iex.Binop.arg2, irbb, irout);
+    Exp *arg1 = translate_expr(context, expr->Iex.Binop.arg1, irbb, irout);
+    Exp *arg2 = translate_expr(context, expr->Iex.Binop.arg2, irbb, irout);
 
     switch (expr->Iex.Binop.op)
     {
@@ -856,108 +1237,108 @@ Exp *translate_simple_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
     
     case Iop_Shl8:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(LSHIFT, arg1, new Cast(arg2, REG_8, CAST_UNSIGNED));
     
     case Iop_Shl16:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(LSHIFT, arg1, new Cast(arg2, REG_16, CAST_UNSIGNED));
     
     case Iop_Shl32:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(LSHIFT, arg1, new Cast(arg2, REG_32, CAST_UNSIGNED));
     
     case Iop_Shl64:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(LSHIFT, arg1, new Cast(arg2, REG_64, CAST_UNSIGNED));
     
     case Iop_Shr8:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(RSHIFT, arg1, new Cast(arg2, REG_8, CAST_UNSIGNED));
     
     case Iop_Shr16:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(RSHIFT, arg1, new Cast(arg2, REG_16, CAST_UNSIGNED));
     
     case Iop_Shr32:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(RSHIFT, arg1, new Cast(arg2, REG_32, CAST_UNSIGNED));
     
     case Iop_Shr64:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(RSHIFT, arg1, new Cast(arg2, REG_64, CAST_UNSIGNED));
     
     case Iop_Sar8:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(ARSHIFT, arg1, new Cast(arg2, REG_8, CAST_UNSIGNED));
     
     case Iop_Sar16:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(ARSHIFT, arg1, new Cast(arg2, REG_16, CAST_UNSIGNED));
     
     case Iop_Sar32:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(ARSHIFT, arg1, new Cast(arg2, REG_32, CAST_UNSIGNED));
     
     case Iop_Sar64:
 
-        if (!count_opnd && !use_eflags_thunks)
+        if (!context->count_opnd && !use_eflags_thunks)
         {
-            count_opnd = arg2;
+            context->count_opnd = arg2;
         }
 
         return new BinOp(ARSHIFT, arg1, new Cast(arg2, REG_64, CAST_UNSIGNED));
@@ -982,27 +1363,27 @@ Exp *translate_simple_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 
     case Iop_32HLto64:
     
-        return translate_32HLto64(arg1, arg2);
+        return translate_32HLto64(context, arg1, arg2);
     
     case Iop_MullS8:
     
-        return translate_MullS8(arg1, arg2);
+        return translate_MullS8(context, arg1, arg2);
     
     case Iop_MullU32:
     
-        return translate_MullU32(arg1, arg2);
+        return translate_MullU32(context, arg1, arg2);
     
     case Iop_MullS32:
     
-        return translate_MullS32(arg1, arg2);
+        return translate_MullS32(context, arg1, arg2);
     
     case Iop_DivModU64to32:
     
-        return translate_DivModU64to32(arg1, arg2);
+        return translate_DivModU64to32(context, arg1, arg2);
     
     case Iop_DivModS64to32:
     
-        return translate_DivModS64to32(arg1, arg2);
+        return translate_DivModS64to32(context, arg1, arg2);
 
     case Iop_DivU32:
     
@@ -1030,7 +1411,7 @@ Exp *translate_simple_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
     return NULL;
 }
 
-Exp *translate_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_binop(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(irbb);
     assert(expr);
@@ -1038,7 +1419,7 @@ Exp *translate_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 
     Exp *result;
 
-    if ((result = translate_simple_binop(expr, irbb, irout)) != NULL)
+    if ((result = translate_simple_binop(context, expr, irbb, irout)) != NULL)
     {
         return result;
     }
@@ -1065,7 +1446,6 @@ Exp *translate_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 
     case Iop_F64toI32U: /* IRRoundingMode(I32) x F64 -> unsigned I32 */
 
-    case Iop_I16StoF64: /*                       signed I16 -> F64 */
     case Iop_I32StoF64: /*                       signed I32 -> F64 */
     case Iop_I64StoF64: /* IRRoundingMode(I32) x signed I64 -> F64 */
     case Iop_I64UtoF64: /* IRRoundingMode(I32) x unsigned I64 -> F64 */
@@ -1073,11 +1453,9 @@ Exp *translate_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 
     case Iop_I32UtoF64: /*                       unsigned I32 -> F64 */
 
-    case Iop_F32toI16S: /* IRRoundingMode(I32) x F32 -> signed I16 */
     case Iop_F32toI32S: /* IRRoundingMode(I32) x F32 -> signed I32 */
     case Iop_F32toI64S: /* IRRoundingMode(I32) x F32 -> signed I64 */
 
-    case Iop_I16StoF32: /*                       signed I16 -> F32 */
     case Iop_I32StoF32: /* IRRoundingMode(I32) x signed I32 -> F32 */
     case Iop_I64StoF32: /* IRRoundingMode(I32) x signed I64 -> F32 */
 
@@ -1124,32 +1502,32 @@ Exp *translate_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 /*
     case Iop_CmpF64:            
 
-        return translate_CmpF64(expr, irbb, irout);
+        return translate_CmpF64(context, expr, irbb, irout);
 
     // arg1 in this case, specifies rounding mode, and so is ignored
     case Iop_I64toF64:
 
-        arg2 = translate_expr(expr->Iex.Binop.arg2, irbb, irout);
+        arg2 = translate_expr(context, expr->Iex.Binop.arg2, irbb, irout);
         return new Cast( arg2, REG_64, CAST_FLOAT );
 
     case Iop_F64toI64:
         
-        arg2 = translate_expr(expr->Iex.Binop.arg2, irbb, irout);
+        arg2 = translate_expr(context, expr->Iex.Binop.arg2, irbb, irout);
         return new Cast( arg2, REG_64, CAST_INTEGER );
 
     case Iop_F64toF32:
 
-        arg2 = translate_expr(expr->Iex.Binop.arg2, irbb, irout);
+        arg2 = translate_expr(context, expr->Iex.Binop.arg2, irbb, irout);
         return new Cast( arg2, REG_32, CAST_FLOAT );
 
     case Iop_F64toI32:
 
-        arg2 = translate_expr(expr->Iex.Binop.arg2, irbb, irout);
+        arg2 = translate_expr(context, expr->Iex.Binop.arg2, irbb, irout);
         return new Cast( arg2, REG_32, CAST_INTEGER );
 
     case Iop_F64toI16:
 
-        arg2 = translate_expr(expr->Iex.Binop.arg2, irbb, irout);
+        arg2 = translate_expr(context, expr->Iex.Binop.arg2, irbb, irout);
         return new Cast( arg2, REG_16, CAST_INTEGER );
 
     case Iop_RoundF64toInt:
@@ -1159,13 +1537,13 @@ Exp *translate_binop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 */
     default:
 
-        throw "Unrecognized binary op";
+        panic("Unrecognized binary op");
     }
 
     return NULL;
 }
 
-Exp *translate_triop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_triop(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(irbb);
     assert(expr);
@@ -1177,12 +1555,11 @@ Exp *translate_triop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
     // the first argument specifies the rounding mode, which we have
     // chosen to ignore for now. See Notes for detailed explanation.
     //
-    Exp *arg2 = translate_expr(expr->Iex.Triop.arg2, irbb, irout);
-    Exp *arg3 = translate_expr(expr->Iex.Triop.arg3, irbb, irout);
+    Exp *arg2 = translate_expr(context, expr->Iex.Triop.details->arg2, irbb, irout);
+    Exp *arg3 = translate_expr(context, expr->Iex.Triop.details->arg3, irbb, irout);
 
-    switch (expr->Iex.Triop.op)
+    switch (expr->Iex.Triop.details->op)
     {
-
     case Iop_AddF64:
     case Iop_SubF64:
     case Iop_MulF64:
@@ -1201,7 +1578,7 @@ Exp *translate_triop(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 
     default:
 
-        throw "Unrecognized ternary op";
+        panic("Unrecognized ternary op");
     }
 
     return NULL;
@@ -1279,36 +1656,36 @@ Exp *emit_mux0x(vector<Stmt *> *irout, reg_t type,
     return temp;
 }
 
-Exp *translate_mux0x(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_ITE(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
     assert(irout);
 
-    IRExpr *cond = expr->Iex.Mux0X.cond;
-    IRExpr *expr0 = expr->Iex.Mux0X.expr0;
-    IRExpr *exprX = expr->Iex.Mux0X.exprX;
+    IRExpr *cond = expr->Iex.ITE.cond;
+    IRExpr *iftrue = expr->Iex.ITE.iftrue;
+    IRExpr *iffalse = expr->Iex.ITE.iffalse;
 
     assert(cond);
-    assert(expr0);
-    assert(exprX);
+    assert(iftrue);
+    assert(iffalse);
 
     // It's assumed that both true and false expressions have the
     // same type so that when we create a temp to assign it to, we
     // can just use one type
-    reg_t type = IRType_to_reg_type(typeOfIRExpr(irbb->tyenv, expr0));
+    reg_t type = IRType_to_reg_type(typeOfIRExpr(irbb->tyenv, iftrue));
     reg_t cond_type = IRType_to_reg_type(typeOfIRExpr(irbb->tyenv, cond));
 
-    Exp *condE = translate_expr(cond, irbb, irout);
-    Exp *exp0 = translate_expr(expr0, irbb, irout);
-    Exp *expX = translate_expr(exprX, irbb, irout);
+    Exp *condE = translate_expr(context, cond, irbb, irout);
+    Exp *exp0 = translate_expr(context, iftrue, irbb, irout);
+    Exp *expX = translate_expr(context, iffalse, irbb, irout);
 
     condE = _ex_eq(condE, ex_const(cond_type, 0));
 
     return emit_mux0x(irout, type, condE, exp0, expX);
 }
 
-Exp *translate_load(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_load(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
@@ -1320,13 +1697,13 @@ Exp *translate_load(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 
     rtype = IRType_to_reg_type(expr->Iex.Load.ty);
 
-    addr = translate_expr(expr->Iex.Load.addr, irbb, irout);
+    addr = translate_expr(context, expr->Iex.Load.addr, irbb, irout);
     mem = new Mem(addr, rtype);
 
     return mem;
 }
 
-Exp *translate_tmp_ex(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_tmp_ex(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
@@ -1345,7 +1722,7 @@ Exp *translate_tmp_ex(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 //----------------------------------------------------------------------
 // Translate a single expression
 //----------------------------------------------------------------------
-Exp *translate_expr(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *translate_expr(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(irout);
 
@@ -1361,7 +1738,7 @@ Exp *translate_expr(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
     
     case Iex_Get:
     
-        result = translate_get(expr, irbb, irout);
+        result = translate_get(context, expr, irbb, irout);
         break;
     
     case Iex_GetI:
@@ -1370,53 +1747,53 @@ Exp *translate_expr(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
         break;
     
     case Iex_RdTmp:
-        result = translate_tmp_ex(expr, irbb, irout);
+        result = translate_tmp_ex(context, expr, irbb, irout);
         break;
     
     case Iex_Triop:
     
-        result = translate_triop(expr, irbb, irout);
+        result = translate_triop(context, expr, irbb, irout);
         break;
     
     case Iex_Binop:
     
-        result = translate_binop(expr, irbb, irout);
+        result = translate_binop(context, expr, irbb, irout);
         break;
     
     case Iex_Unop:
     
-        result = translate_unop(expr, irbb, irout);
+        result = translate_unop(context, expr, irbb, irout);
         break;
     
     case Iex_Load:
     
-        result = translate_load(expr, irbb, irout);
+        result = translate_load(context, expr, irbb, irout);
         break;
     
     case Iex_Const:
     
-        result = translate_const(expr);
+        result = translate_const(context, expr);
         break;
     
-    case Iex_Mux0X:
+    case Iex_ITE:
     
-        result = translate_mux0x(expr, irbb, irout);
+        result = translate_ITE(context, expr, irbb, irout);
         break;
     
     case Iex_CCall:
     
-        result = translate_ccall(expr, irbb, irout);
+        result = translate_ccall(context, expr, irbb, irout);
         break;
     
     default:
     
-        throw "Unrecognized expression type";
+        panic("Unrecognized expression type");
     }
 
     return result;
 }
 
-Stmt *translate_tmp_st(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
+Stmt *translate_tmp_st(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(stmt);
     assert(irbb);
@@ -1427,13 +1804,13 @@ Stmt *translate_tmp_st(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
     string name;
 
     type = typeOfIRExpr(irbb->tyenv, stmt->Ist.WrTmp.data);
-    data = translate_expr(stmt->Ist.WrTmp.data, irbb, irout);
+    data = translate_expr(context, stmt->Ist.WrTmp.data, irbb, irout);
     name = int_to_str(get_type_size(IRType_to_reg_type(type))) + "t" + int_to_str(stmt->Ist.WrTmp.tmp);
 
     return new Move(mk_temp(name, type), data);
 }
 
-Stmt *translate_store(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
+Stmt *translate_store(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(stmt);
     assert(irbb);
@@ -1445,23 +1822,23 @@ Stmt *translate_store(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
     IRType itype;
     reg_t rtype;
 
-    dest = translate_expr(stmt->Ist.Store.addr, irbb, irout);
+    dest = translate_expr(context, stmt->Ist.Store.addr, irbb, irout);
     itype = typeOfIRExpr(irbb->tyenv, stmt->Ist.Store.data);
     rtype = IRType_to_reg_type(itype);
     mem = new Mem(dest, rtype);
-    data = translate_expr(stmt->Ist.Store.data, irbb, irout);
+    data = translate_expr(context, stmt->Ist.Store.data, irbb, irout);
 
     return new Move(mem, data);
 }
 
-Stmt *translate_imark(IRStmt *stmt, IRSB *irbb)
+Stmt *translate_imark(bap_context_t *context, IRStmt *stmt, IRSB *irbb)
 {
     assert(stmt);
 
     return mk_dest_label(stmt->Ist.IMark.addr);
 }
 
-Stmt *translate_exit(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
+Stmt *translate_exit(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(stmt);
     assert(irbb);
@@ -1470,7 +1847,7 @@ Stmt *translate_exit(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
     // We assume the jump destination is always ever a 32 bit uint
     assert(stmt->Ist.Exit.dst->tag == Ico_U32);
 
-    Exp *cond = translate_expr(stmt->Ist.Exit.guard, irbb, irout);
+    Exp *cond = translate_expr(context, stmt->Ist.Exit.guard, irbb, irout);
 
     if (stmt->Ist.Exit.jk == Ijk_MapFail)
     {
@@ -1491,7 +1868,7 @@ Stmt *translate_exit(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
 //----------------------------------------------------------------------
 // Translate a single statement
 //----------------------------------------------------------------------
-Stmt *translate_stmt(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
+Stmt *translate_stmt(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(stmt);
     assert(irout);
@@ -1507,7 +1884,7 @@ Stmt *translate_stmt(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
     
     case Ist_IMark:
     
-        result = translate_imark(stmt, irbb);
+        result = translate_imark(context, stmt, irbb);
         break;
     
     case Ist_AbiHint:
@@ -1517,7 +1894,7 @@ Stmt *translate_stmt(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
     
     case Ist_Put:
     
-        result = translate_put(stmt, irbb, irout);
+        result = translate_put(context, stmt, irbb, irout);
         break;
     
     case Ist_PutI:
@@ -1527,12 +1904,12 @@ Stmt *translate_stmt(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
     
     case Ist_WrTmp:
     
-        result = translate_tmp_st(stmt, irbb, irout);
+        result = translate_tmp_st(context, stmt, irbb, irout);
         break;
     
     case Ist_Store:
     
-        result = translate_store(stmt, irbb, irout);
+        result = translate_store(context, stmt, irbb, irout);
         break;
     
     case Ist_CAS:
@@ -1557,12 +1934,12 @@ Stmt *translate_stmt(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
     
     case Ist_Exit:
     
-        result = translate_exit(stmt, irbb, irout);
+        result = translate_exit(context, stmt, irbb, irout);
         break;
     
     default:
     
-        throw "Unrecognized statement type";
+        panic("Unrecognized statement type");
     }
 
     assert(result);
@@ -1570,7 +1947,7 @@ Stmt *translate_stmt(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
     return result;
 }
 
-Stmt *translate_jumpkind(IRSB *irbb, vector<Stmt *> *irout)
+Stmt *translate_jumpkind(bap_context_t *context, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(irbb);
 
@@ -1595,7 +1972,7 @@ Stmt *translate_jumpkind(IRSB *irbb, vector<Stmt *> *irout)
     }
     else
     {
-        dest = translate_expr(irbb->next, irbb, irout);
+        dest = translate_expr(context, irbb->next, irbb, irout);
     }
 
     switch (irbb->jumpkind)
@@ -1639,6 +2016,11 @@ Stmt *translate_jumpkind(IRSB *irbb, vector<Stmt *> *irout)
         result = new Special(uTag + "NoDecode");
         break;
     
+    case Ijk_SigTRAP:
+
+        result = new Special(uTag + "SIGTRAP");
+        break;
+
     case Ijk_Sys_syscall:
     case Ijk_Sys_int32:
     case Ijk_Sys_int128:
@@ -1652,7 +2034,7 @@ Stmt *translate_jumpkind(IRSB *irbb, vector<Stmt *> *irout)
     default:
     
         Exp::destroy(dest);
-        throw "Unrecognized jump kind";
+        panic("Unrecognized jump kind");
     }
 
     assert(result);
@@ -1666,16 +2048,31 @@ bool is_special(address_t inst)
     return false;
 }
 
-vector<Stmt *> *translate_special(address_t inst)
+vector<Stmt *> *translate_special(bap_context_t *context, address_t inst)
 {
     panic("Why did this get called? We are now saying that no instruction is a special.");
+
+    return NULL;
+}
+
+//----------------------------------------------------------------------
+// Generate Stmts for unknown/untranslated machine instruction
+//----------------------------------------------------------------------
+vector<Stmt *> *translate_unknown(bap_context_t *context, string tag)
+{
+    vector<Stmt *> *irout = new vector<Stmt *>();
+
+    irout->push_back(new Special(uTag + tag));
+
+    return irout;
 }
 
 //----------------------------------------------------------------------
 // Translate an IRSB into a vector of Stmts in our IR
 //----------------------------------------------------------------------
-vector<Stmt *> *translate_irbb(IRSB *irbb)
+vector<Stmt *> *translate_irbb(bap_context_t *context, IRSB *irbb)
 {
+    int i = 0;
 
     //
     // It's assumed that each irbb only contains the translation for
@@ -1684,29 +2081,27 @@ vector<Stmt *> *translate_irbb(IRSB *irbb)
 
     // For some instructions, the eflag affecting IR needs out-of-band
     // arguments. This function cleans up those operands.
-    do_cleanups_before_processing();
+    do_cleanups_before_processing(context);
 
     assert(irbb);
 
     vector<Stmt *> *irout = new vector<Stmt *>();
-
-    assert(irout);
-
-    int i;
-    Stmt *st = NULL;
+    assert(irout);    
 
     //
     // Translate all the statements
     //
-    IRStmt *stmt;
-    stmt = irbb->stmts[0];
+    IRStmt *stmt = irbb->stmts[0];
     assert(stmt->tag == Ist_IMark);
 
-    st = translate_stmt(stmt, irbb, irout);
+    Stmt *st = translate_stmt(context, stmt, irbb, irout);
+    
+    assert(st);
     assert(st->stmt_type == LABEL);
+    
     irout->push_back(st);
 
-    for (int i = 0; i < irbb->tyenv->types_used; i++)
+    for (i = 0; i < irbb->tyenv->types_used; i++)
     {
         IRType ty = irbb->tyenv->types[i];
         reg_t typ = IRType_to_reg_type(ty);
@@ -1718,11 +2113,11 @@ vector<Stmt *> *translate_irbb(IRSB *irbb)
 
     for (i = 1; i < irbb->stmts_used; i++)
     {
-        IRStmt *stmt = irbb->stmts[i];
+        stmt = irbb->stmts[i];
 
         try
         {
-            st = translate_stmt(stmt, irbb, irout);
+            st = translate_stmt(context, stmt, irbb, irout);
         }
         catch (const char *e)
         {
@@ -1737,7 +2132,7 @@ vector<Stmt *> *translate_irbb(IRSB *irbb)
     //
     try
     {
-        st = translate_jumpkind(irbb, irout);
+        st = translate_jumpkind(context, irbb, irout);
     }
     catch (const char *e)
     {
@@ -1760,24 +2155,42 @@ vector<Stmt *> *translate_irbb(IRSB *irbb)
 //
 //======================================================================
 
-bap_block_t *generate_vex_ir(VexArch guest, uint8_t *data, address_t inst)
+bap_block_t *generate_vex_ir(bap_context_t *context, uint8_t *data, address_t inst)
 {
     bap_block_t *vblock = new bap_block_t;
-    
-    vblock->inst = inst;
-    vblock->inst_size = disasm_insn(guest, data, vblock->str_mnem, vblock->str_op);
-    assert(vblock->inst_size != 0 && vblock->inst_size != -1);
 
-    // Skip the VEX translation of special instructions because these
-    // are also the ones that VEX does not handle
-    if (!is_special(inst))
+    vblock->vex_ir = NULL;
+    vblock->bap_ir = NULL;
+
+    vblock->inst = inst;
+    vblock->inst_size = disasm_insn(context->guest, data, inst, vblock->str_mnem, vblock->str_op);
+    
+    if (vblock->inst_size > 0)
     {
-        vblock->vex_ir = translate_insn(guest, data, inst, NULL);
-    }
+        if (context->inst_size != 0 &&
+            context->inst + context->inst_size != inst)
+        {
+            CC_OP_RESET(context);
+        }
+
+        context->inst = inst;
+        context->inst_size = vblock->inst_size;
+
+        // Skip the VEX translation of special instructions because these
+        // are also the ones that VEX does not handle
+        if (!is_special(inst))
+        {
+            vblock->vex_ir = translate_insn(context->guest, data, inst, NULL);
+        }
+        else
+        {
+            vblock->vex_ir = NULL;
+        }
+    }    
     else
     {
-        vblock->vex_ir = NULL;
-    }
+        panic("generate_vex_ir(): Error while disassembling instruction");
+    }    
 
     return vblock;
 }
@@ -1786,14 +2199,14 @@ bap_block_t *generate_vex_ir(VexArch guest, uint8_t *data, address_t inst)
 // Take a vector of instrs function and translate it into VEX IR blocks
 // and store them in the vector of bap blocks
 //----------------------------------------------------------------------
-vector<bap_block_t *> generate_vex_ir(VexArch guest, uint8_t *data, address_t start, address_t end)
+vector<bap_block_t *> generate_vex_ir(bap_context_t *context, uint8_t *data, address_t start, address_t end)
 {
     vector<bap_block_t *> results;
     address_t inst;
 
     for (inst = start; inst < end; )
     {
-        bap_block_t *vblock = generate_vex_ir(guest, data, inst);        
+        bap_block_t *vblock = generate_vex_ir(context, data, inst);        
         results.push_back(vblock);
 
         inst += vblock->inst_size;
@@ -1806,7 +2219,7 @@ vector<bap_block_t *> generate_vex_ir(VexArch guest, uint8_t *data, address_t st
 // Insert both special("call") and special("ret") into the code.
 // This function should be replacing add_special_returns()
 //----------------------------------------------------------------------
-void insert_specials(bap_block_t *block)
+void insert_specials(bap_context_t *context, bap_block_t *block)
 {
     IRSB *bb = block->vex_ir;
 
@@ -1857,60 +2270,117 @@ void insert_specials(bap_block_t *block)
     }
 }
 
-void generate_bap_ir_block(VexArch guest, bap_block_t *block)
+void track_flag_thunks(bap_context_t *context, bap_block_t *block)
+{
+    vector<Stmt *> *ir = block->bap_ir;
+    int opi = -1, dep1 = -1, dep2 = -1, ndep = -1, mux0x = -1;
+
+    // Look for occurrence of CC_OP assignment
+    // These will have the indices of the CC_OP stmts    
+    get_thunk_index(ir, &opi, &dep1, &dep2, &ndep, &mux0x);
+
+    if (opi == -1)        
+    {
+        // doesn't set flags
+        return;
+    }
+
+    Stmt *op_stmt = ir->at(opi);
+
+    if (op_stmt->stmt_type == MOVE)
+    {
+        Move *op_mov = (Move *)op_stmt;
+
+        if (op_mov->rhs->exp_type == CONSTANT)
+        {
+            Constant *op_const = (Constant *)op_mov->rhs;
+            
+            // save CC_OP value
+            CC_OP_SET(context, op_const->val);
+        }
+    }
+}
+
+bap_context_t *init_bap_context(VexArch guest)
+{
+    bap_context_t *context = new bap_context_t;
+
+    memset(context, 0, sizeof(bap_context_t));    
+    
+    CC_OP_RESET(context);
+
+    context->guest = guest; 
+
+    return context;
+}
+
+void generate_bap_ir(bap_context_t *context, bap_block_t *block)
 {
     static unsigned int ir_addr = 100; // Argh, this is dumb
 
-    assert(block);
+    assert(context);
+    assert(block);    
 
-    // Set the global everyone else will look at.
-    guest_arch = guest;
+    block->bap_ir = NULL;
 
     // Translate the block
     if (is_special(block->inst))
     {
-        block->bap_ir = translate_special(block->inst);
+        block->bap_ir = translate_special(context, block->inst);
     }
-    else
+    else if (block->vex_ir)
     {
-        block->bap_ir = translate_irbb(block->vex_ir);
-    }
-
-    assert(block->bap_ir);
-    vector<Stmt *> *vir = block->bap_ir;
-
-    // Go through block and add Special's for ret
-    insert_specials(block);
-
-    // Go through the block and add on eflags modifications
-    modify_flags(block);
-
-    // Delete EFLAGS get thunks
-    if (!use_eflags_thunks)
-    {
-        del_get_thunk(block);
+        block->bap_ir = translate_irbb(context, block->vex_ir);
     }
 
-    // Add the asm and ir addresses
-    for (int j = 0; j < vir->size(); j++)
+    if (block->bap_ir)
     {
-        if (block->inst)
+        vector<Stmt *> *vir = block->bap_ir;
+
+        // Go through block and add Special's for ret
+        insert_specials(context, block);
+
+        // Track current value of CC_OP guest register
+        track_flag_thunks(context, block);
+
+        // Go through the block and add on eflags modifications
+        modify_flags(context, block);
+
+        // Delete EFLAGS get thunks
+        if (!use_eflags_thunks)
         {
-            vir->at(j)->asm_address = block->inst;
+            del_get_thunk(block);
         }
 
-        vir->at(j)->ir_address = ir_addr++;
-    }
+        // Delete trash after eliminated x86g_use_seg_selector call
+        del_seg_selector_trash(block);
+
+        // Add the asm and ir addresses
+        for (int j = 0; j < vir->size(); j++)
+        {
+            if (block->inst)
+            {
+                vir->at(j)->asm_address = block->inst;
+            }
+
+            vir->at(j)->ir_address = ir_addr++;
+        }
+    } 
+    else
+    {
+        block->bap_ir = translate_unknown(context, "Untranslated");
+    }   
 }
 
-vector<bap_block_t *> generate_bap_ir(VexArch guest, vector<bap_block_t *> vblocks)
+vector<bap_block_t *> generate_bap_ir(bap_context_t *context, vector<bap_block_t *> vblocks)
 {
     unsigned int vblocksize = vblocks.size();
 
     for (int i = 0; i < vblocksize; i++)
     {
         bap_block_t *block = vblocks.at(i);
-        generate_bap_ir_block(guest, block);
+
+        generate_bap_ir(context, block);
     }
 
     return vblocks;
@@ -1929,7 +2399,7 @@ int match_mux0x(vector<Stmt *> *ir, unsigned int i, Exp **cond, Exp **exp0,	Exp 
 // this code depends on the order of statements from emit_mux0x()
 #ifndef MUX_AS_CJMP
 
-    if (i < 0 || 
+    if ((int)i < 0 || 
         i >= ir->size() || 
         ir->at(i + 0)->stmt_type != VARDECL || /* temp */
         ir->at(i + 1)->stmt_type != VARDECL || /* widened_cond */
@@ -1995,7 +2465,7 @@ int match_mux0x(vector<Stmt *> *ir, unsigned int i, Exp **cond, Exp **exp0,	Exp 
 
 #else
 
-    if (i < 0 || i >= ir->size() || 
+    if ((int)i < 0 || i >= ir->size() || 
         ir->at(i)->stmt_type != MOVE || 
         ir->at(i + 3)->stmt_type != MOVE || 
         ir->at(i + 2)->stmt_type != LABEL || 
@@ -2054,6 +2524,7 @@ int match_mux0x(vector<Stmt *> *ir, unsigned int i, Exp **cond, Exp **exp0,	Exp 
 reg_t get_exp_type_from_cast(Cast *cast)
 {
     assert(cast);
+
     return cast->typ;
 }
 
@@ -2081,11 +2552,10 @@ reg_t get_exp_type(Exp *exp)
     return type;
 }
 
-void do_cleanups_before_processing()
+void do_cleanups_before_processing(bap_context_t *context)
 {
-    if (count_opnd)
+    if (context->count_opnd)
     {
-        count_opnd = NULL;
+        context->count_opnd = NULL;
     }
 }
-

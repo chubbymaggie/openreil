@@ -1,17 +1,14 @@
 #include <string>
+#include <algorithm>
 #include <vector>
 
-#include "capstone.h"
+#include "capstone/capstone.h"
 
 #include "libvex.h"
 
-#include "irtoir.h"
-#include "irtoir-internal.h"
-
-#define DISASM_MAX_INST_LEN 30
-
 using namespace std;
 
+#include "irtoir-internal.h"
 #include "disasm.h"
 
 typedef enum _dsiasm_arg_t
@@ -27,7 +24,7 @@ Temp *i386_disasm_arg_to_temp(uint8_t arg)
     {
     case X86_REG_AH:
 
-        fprintf(stderr, "i386_disasm_arg_to_temp() WARNING: using AX instead AH\n");
+        log_write(LOG_WARN, "i386_disasm_arg_to_temp(): using AX instead AH\n");
         return mk_reg("EAX", REG_16);
 
     case X86_REG_AL:
@@ -40,7 +37,7 @@ Temp *i386_disasm_arg_to_temp(uint8_t arg)
     
     case X86_REG_BH:
 
-        fprintf(stderr, "i386_disasm_arg_to_temp() WARNING: using BX instead BH\n");
+        log_write(LOG_WARN, "i386_disasm_arg_to_temp(): using BX instead BH\n");
         return mk_reg("EBX", REG_16);
     
     case X86_REG_BL:
@@ -57,7 +54,7 @@ Temp *i386_disasm_arg_to_temp(uint8_t arg)
     
     case X86_REG_CH:
 
-        fprintf(stderr, "i386_disasm_arg_to_temp() WARNING: using CX instead CH\n");
+        log_write(LOG_WARN, "i386_disasm_arg_to_temp(): using CX instead CH\n");
         return mk_reg("ECX", REG_16);
     
     case X86_REG_CL:
@@ -74,7 +71,7 @@ Temp *i386_disasm_arg_to_temp(uint8_t arg)
     
     case X86_REG_DH:
 
-        fprintf(stderr, "i386_disasm_arg_to_temp() WARNING: using DX instead DH\n");
+        log_write(LOG_WARN, "i386_disasm_arg_to_temp(): using DX instead DH\n");
         return mk_reg("EDX", REG_16);
     
     case X86_REG_DI:
@@ -279,13 +276,13 @@ Temp *disasm_arg_to_temp(VexArch guest, uint8_t arg)
     
     default:
     
-        throw "disasm_arg_to_temp(): unsupported arch";
+        panic("disasm_arg_to_temp(): unsupported arch");
     }    
 
     return NULL;
 }
 
-void disasm_open(VexArch guest, csh *handle)
+void disasm_open(VexArch guest, address_t addr, csh *handle)
 {
     cs_arch arch;
     cs_mode mode;
@@ -301,40 +298,44 @@ void disasm_open(VexArch guest, csh *handle)
     case VexArchARM:
     
         arch = CS_ARCH_ARM;
-        mode = CS_MODE_ARM;
+        mode = IS_ARM_THUMB(addr) ? CS_MODE_THUMB : CS_MODE_ARM;
         break;
     
     default:
     
-        throw "disasm_open(): unsupported arch";
+        panic("disasm_open(): unsupported arch");
     }
 
     if (cs_open(arch, mode, handle) != CS_ERR_OK)
     {
-        throw "cs_open() fails";
+        panic("cs_open() fails");
     }    
 }
 
-int disasm_insn(VexArch guest, uint8_t *data, string &mnemonic, string &op)
+int disasm_insn(VexArch guest, uint8_t *data, address_t addr, string &mnemonic, string &op)
 {
     int ret = -1;
     
     csh handle;
     cs_insn *insn;
 
-    disasm_open(guest, &handle);
+    disasm_open(guest, addr, &handle);
 
-    size_t count = cs_disasm_ex(handle, data, DISASM_MAX_INST_LEN, 0, 1, &insn);    
+    size_t count = cs_disasm(handle, data, DISASM_MAX_INST_LEN, 0, 1, &insn);    
     if (count > 0) 
-    {
+    {   
+        // get instruction length     
         ret = (int)insn[0].size;
+
+        // get assembly code
         mnemonic = string(insn[0].mnemonic);
-        op = string(insn[0].op_str);
+        op = string(insn[0].op_str);        
+
         cs_free(insn, count);
     } 
     else
     {
-        fprintf(stderr, "ERROR: Failed to disassemble\n");
+        log_write(LOG_ERR, "disasm_insn(): failed to disassemble\n");
     }
 
     cs_close(&handle);
@@ -368,64 +369,9 @@ int i386_disasm_arg_special(cs_insn *insn, vector<Temp *> &args, dsiasm_arg_t ty
 
     switch (insn->id)
     {
-    case X86_INS_RDTSC:
-
-        if (dst)
-        {            
-            args.push_back(mk_reg("EAX", REG_32));
-            args.push_back(mk_reg("EDX", REG_32));
-            return 2;   
-        }
-        else
-        {
-            return 0;
-        }
-
-    case X86_INS_RDTSCP:
-
-        if (dst)
-        {
-            args.push_back(mk_reg("EAX", REG_32));
-            args.push_back(mk_reg("EDX", REG_32));
-            args.push_back(mk_reg("ECX", REG_32));
-            return 3;   
-        }
-        else
-        {
-            return 0;
-        }
-
-    case X86_INS_RDMSR:
-
-        if (src)
-        {            
-            args.push_back(mk_reg("ECX", REG_32));
-            return 1;   
-        }
-        else
-        {
-            args.push_back(mk_reg("EAX", REG_32));
-            args.push_back(mk_reg("EDX", REG_32));
-            return 2;
-        }
-
-    case X86_INS_WRMSR:
-
-        if (src)
-        {            
-            args.push_back(mk_reg("EAX", REG_32));
-            args.push_back(mk_reg("EDX", REG_32));
-            args.push_back(mk_reg("ECX", REG_32));
-            return 3;   
-        }
-        else
-        {
-            return 0;
-        }
-
     case X86_INS_SIDT:        
 
-        if (reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm)))
+        if ((reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm))) != NULL)
         {
             if (src)
             {
@@ -443,7 +389,7 @@ int i386_disasm_arg_special(cs_insn *insn, vector<Temp *> &args, dsiasm_arg_t ty
 
     case X86_INS_SGDT:
 
-        if (reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm)))
+        if ((reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm))) != NULL)
         {
             if (src)
             {
@@ -461,7 +407,7 @@ int i386_disasm_arg_special(cs_insn *insn, vector<Temp *> &args, dsiasm_arg_t ty
 
     case X86_INS_SLDT:
 
-        if (reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm)))
+        if ((reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm))) != NULL)
         {
             if (src)
             {
@@ -479,7 +425,7 @@ int i386_disasm_arg_special(cs_insn *insn, vector<Temp *> &args, dsiasm_arg_t ty
 
     case X86_INS_LIDT:
 
-        if (reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm)))
+        if ((reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm))) != NULL)
         {
             if (src)
             {
@@ -497,7 +443,7 @@ int i386_disasm_arg_special(cs_insn *insn, vector<Temp *> &args, dsiasm_arg_t ty
 
     case X86_INS_LGDT:
 
-        if (reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm)))
+        if ((reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm))) != NULL)
         {
             if (src)
             {
@@ -515,7 +461,7 @@ int i386_disasm_arg_special(cs_insn *insn, vector<Temp *> &args, dsiasm_arg_t ty
 
     case X86_INS_LLDT:
 
-        if (reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm)))
+        if ((reg = i386_reg_name(I386_MODRM_RM(insn->detail->x86.modrm))) != NULL)
         {
             if (src)
             {
@@ -549,75 +495,95 @@ int disasm_arg_special(VexArch guest, cs_insn *insn, vector<Temp *> &args, dsias
     
     default:
     
-        throw "disasm_arg_special(): unsupported arch";
+        panic("disasm_arg_special(): unsupported arch");
     }    
 
     return -1;
 }
 
-int disasm_arg(VexArch guest, uint8_t *data, vector<Temp *> &args, dsiasm_arg_t type)
+int disasm_arg(VexArch guest, uint8_t *data, address_t addr, vector<Temp *> &args, dsiasm_arg_t type)
 {
     int ret = -1;
     
     csh handle;
     cs_insn *insn;
 
-    disasm_open(guest, &handle);
+    disasm_open(guest, addr, &handle);
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
-    size_t count = cs_disasm_ex(handle, data, DISASM_MAX_INST_LEN, 0, 1, &insn);    
+    size_t count = cs_disasm(handle, data, DISASM_MAX_INST_LEN, 0, 1, &insn);    
     if (count > 0) 
-    {
-        cs_detail *detail = insn[0].detail;
-        uint8_t *data = NULL;
+    {        
+        cs_regs regs_read, regs_write;
+        uint8_t read_count, write_count;
 
-        // get arguments that capstone fails to recognise properly
+        // get arguments for instructions that capstone fails to recognise properly
         ret = disasm_arg_special(guest, &insn[0], args, type);
         if (ret >= 0)
         {
             return ret;
         }
 
-        if (detail && type == disasm_arg_t_src)
+        // get all registers accessed by this instruction
+        if (cs_regs_access(handle, insn, regs_read, &read_count, regs_write, &write_count) == 0) 
         {
-            ret = detail->regs_read_count;
-            data = detail->regs_read;
-        }
-        else if (detail && type == disasm_arg_t_dst)
-        {
-            ret = detail->regs_write_count;
-            data = detail->regs_write;
-        }
+            uint16_t *regs = NULL;
+            uint8_t count = 0;
 
-        if (ret > 0) 
-        {
-            for (int i = 0; i < ret; i++) 
+            if (read_count > 0 && type == disasm_arg_t_src) 
+            {                
+                regs = regs_read;
+                count = read_count;                
+            }
+            else if (write_count > 0 && type == disasm_arg_t_dst) 
+            {                
+                regs = regs_write;
+                count = write_count;                
+            }
+
+            for (int i = 0; i < count; i++) 
             {
-                Temp *temp = disasm_arg_to_temp(guest, data[i]);
+                Temp *temp = disasm_arg_to_temp(guest, regs[i]);
                 if (temp)
                 {
-                    args.push_back(temp);
-                }                
+                    bool exists = false;
+                    vector<Temp *>::iterator it;
+
+                    for (it = args.begin(); it != args.end(); ++it)
+                    {
+                        if ((*it)->name == temp->name)
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+
+                    if (!exists)
+                    {
+                        args.push_back(temp);
+                        ret += 1;
+                    }                    
+                }
             }
-        }    
+        }
 
         cs_free(insn, count);
     } 
     else
     {
-        fprintf(stderr, "ERROR: Failed to disassemble\n");
+        log_write(LOG_ERR, "disasm_arg(): failed to disassemble\n");
     }
 
     cs_close(&handle);
     return ret;
 }
 
-int disasm_arg_src(VexArch guest, uint8_t *data, vector<Temp *> &args)
+int disasm_arg_src(VexArch guest, uint8_t *data, address_t addr, vector<Temp *> &args)
 {
-    return disasm_arg(guest, data, args, disasm_arg_t_src);
+    return disasm_arg(guest, data, addr, args, disasm_arg_t_src);
 }
 
-int disasm_arg_dst(VexArch guest, uint8_t *data, vector<Temp *> &args)
+int disasm_arg_dst(VexArch guest, uint8_t *data, address_t addr, vector<Temp *> &args)
 {
-    return disasm_arg(guest, data, args, disasm_arg_t_dst);
+    return disasm_arg(guest, data, addr, args, disasm_arg_t_dst);
 }

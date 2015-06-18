@@ -1,8 +1,13 @@
-#include "irtoir-internal.h"
-#include "libvex_guest_arm.h"
+#include <stdio.h>
+#include <string>
+#include <iostream>
 #include <assert.h>
 #include <stddef.h>
 
+using namespace std;
+
+#include "irtoir-internal.h"
+#include "libvex_guest_arm.h"
 
 //
 // Register offsets, copied from VEX/priv/guest_arm/toIR.c
@@ -26,7 +31,7 @@
 #define OFFB_R12      offsetof(VexGuestARMState, guest_R12)
 #define OFFB_R13      offsetof(VexGuestARMState, guest_R13)
 #define OFFB_R14      offsetof(VexGuestARMState, guest_R14)
-#define OFFB_R15T      offsetof(VexGuestARMState, guest_R15T)
+#define OFFB_R15T     offsetof(VexGuestARMState, guest_R15T)
 
 // We assume you are compiling with the included patched version of
 // VEX. If not, you may need to define ARM_THUNKS to revert to
@@ -36,30 +41,99 @@
 #define OFFB_CC_DEP2  offsetof(VexGuestARMState, guest_CC_DEP2)
 #define OFFB_CC_NDEP  offsetof(VexGuestARMState, guest_CC_NDEP)
 
+#define OFFB_ITSTATE  offsetof(VexGuestARMState, guest_ITSTATE)
+
+//
+// Condition code enum copied from VEX/priv/guest_arm_defs.h
+// Note: If these constants are ever changed, then they would
+//       need to be re-copied from the newer version of VEX.
+//
+typedef enum
+{
+    ARMCondEQ     = 0,      /* equal                    */
+    ARMCondNE     = 1,      /* not equal                */
+
+    ARMCondHS     = 2,      /* higher or same           */
+    ARMCondLO     = 3,      /* lower                    */
+
+    ARMCondMI     = 4,      /* minus (negative)         */
+    ARMCondPL     = 5,      /* plus (zero or +ve)       */
+
+    ARMCondVS     = 6,      /* overflow                 */
+    ARMCondVC     = 7,      /* no overflow              */
+
+    ARMCondHI     = 8,      /* higher                   */
+    ARMCondLS     = 9,      /* lower or same            */
+
+    ARMCondGE     = 10,     /* signed greater or equal  */
+    ARMCondLT     = 11,     /* signed less than         */
+
+    ARMCondGT     = 12,     /* signed greater           */
+    ARMCondLE     = 13,     /* signed less or equal     */
+
+    ARMCondAL     = 14,     /* always (unconditional)   */
+    ARMCondNV     = 15      /* never (unconditional)    */
+
+} ARMCondcode;
+
+//
+// Copied from VEX/priv/guest_arm_defs.h
+//
+enum 
+{
+    ARMG_CC_OP_COPY = 0,    /* DEP1 = NZCV in 31:28, DEP2 = 0, DEP3 = 0 */
+    ARMG_CC_OP_ADD,         /* DEP1 = argL (Rn), DEP2 = argR (shifter_op), DEP3 = 0 */
+    ARMG_CC_OP_SUB,         /* DEP1 = argL (Rn), DEP2 = argR (shifter_op), DEP3 = 0 */
+    ARMG_CC_OP_ADC,         /* DEP1 = argL (Rn), DEP2 = arg2 (shifter_op), DEP3 = oldC */
+    ARMG_CC_OP_SBB,         /* DEP1 = argL (Rn), DEP2 = arg2 (shifter_op), DEP3 = oldC */
+    ARMG_CC_OP_LOGIC,       /* DEP1 = result, DEP2 = shifter_carry_out (in LSB), DEP3 = old V flag */
+    ARMG_CC_OP_MUL,         /* DEP1 = result, DEP2 = 0, DEP3 = oldC:old_V */
+    ARMG_CC_OP_MULL,        /* DEP1 = resLO32, DEP2 = resHI32, DEP3 = oldC:old_V */
+
+    ARMG_CC_OP_NUMBER
+};
+
+static vector<Stmt *> mod_eflags_copy(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2);
+static vector<Stmt *> mod_eflags_add(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2);
+static vector<Stmt *> mod_eflags_sub(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2);
+static vector<Stmt *> mod_eflags_adc(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3);
+static vector<Stmt *> mod_eflags_sbb(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3);
+static vector<Stmt *> mod_eflags_logic(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2);
+static vector<Stmt *> mod_eflags_umul(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2);
+static vector<Stmt *> mod_eflags_umull(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3);
+
 vector<VarDecl *> arm_get_reg_decls()
 {
     vector<VarDecl *> ret;
     reg_t r32 = REG_32;
+    reg_t r1 = REG_1;
 
-    ret.push_back(new VarDecl("R0",      r32));
-    ret.push_back(new VarDecl("R1",      r32));
-    ret.push_back(new VarDecl("R2",      r32));
-    ret.push_back(new VarDecl("R3",      r32));
-    ret.push_back(new VarDecl("R4",      r32));
-    ret.push_back(new VarDecl("R5",      r32));
-    ret.push_back(new VarDecl("R6",      r32));
-    ret.push_back(new VarDecl("R7",      r32));
-    ret.push_back(new VarDecl("R8",      r32));
-    ret.push_back(new VarDecl("R9",      r32));
-    ret.push_back(new VarDecl("R10",     r32));
-    ret.push_back(new VarDecl("R11",     r32));
-    ret.push_back(new VarDecl("R12",     r32));
-    ret.push_back(new VarDecl("R13",     r32));
-    ret.push_back(new VarDecl("R14",     r32));
-    ret.push_back(new VarDecl("R15",     r32));
-    ret.push_back(new VarDecl("CC_OP",   r32));
-    ret.push_back(new VarDecl("CC_DEP1", r32));
-    ret.push_back(new VarDecl("CC_DEP2", r32));
+    // General purpose 32-bit registers
+    ret.push_back(new VarDecl("R_R0",       r32));
+    ret.push_back(new VarDecl("R_R1",       r32));
+    ret.push_back(new VarDecl("R_R2",       r32));
+    ret.push_back(new VarDecl("R_R3",       r32));
+    ret.push_back(new VarDecl("R_R4",       r32));
+    ret.push_back(new VarDecl("R_R5",       r32));
+    ret.push_back(new VarDecl("R_R6",       r32));
+    ret.push_back(new VarDecl("R_R7",       r32));
+    ret.push_back(new VarDecl("R_R8",       r32));
+    ret.push_back(new VarDecl("R_R9",       r32));
+    ret.push_back(new VarDecl("R_R10",      r32));
+    ret.push_back(new VarDecl("R_R11",      r32));
+    ret.push_back(new VarDecl("R_R12",      r32));
+    ret.push_back(new VarDecl("R_R13",      r32));
+    ret.push_back(new VarDecl("R_R14",      r32));
+    ret.push_back(new VarDecl("R_R15",      r32));
+
+    // Flags
+    ret.push_back(new VarDecl("R_NF",       r1));
+    ret.push_back(new VarDecl("R_ZF",       r1));
+    ret.push_back(new VarDecl("R_CF",       r1));
+    ret.push_back(new VarDecl("R_VF",       r1));
+    ret.push_back(new VarDecl("CC_OP",      r32));
+    ret.push_back(new VarDecl("CC_DEP1",    r32));
+    ret.push_back(new VarDecl("CC_DEP2",    r32));
 
     return ret;
 }
@@ -153,12 +227,17 @@ static string reg_offset_to_name(int offset)
     case OFFB_CC_NDEP:
     
         return "CC_NDEP";
+
+    case OFFB_ITSTATE:
+
+        return "ITSTATE";
     
     default:
     
         panic("reg_offset_to_name(arm): Unrecognized register offset");
     }
 
+    return NULL;
 }
 
 static Exp *translate_get_reg_32(int offset)
@@ -170,7 +249,7 @@ static Exp *translate_get_reg_32(int offset)
     return reg;
 }
 
-Exp  *arm_translate_get(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp  *arm_translate_get(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     int offset = expr->Iex.Get.offset;
 
@@ -188,26 +267,503 @@ static Stmt *translate_put_reg_32(int offset, Exp *data, IRSB *irbb)
     return new Move(reg, data);
 }
 
-Stmt *arm_translate_put(IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
+Stmt *arm_translate_put(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
 {
     int offset = stmt->Ist.Put.offset;
 
-    Exp *data = translate_expr(stmt->Ist.Put.data, irbb, irout);
+    Exp *data = translate_expr(context, stmt->Ist.Put.data, irbb, irout);
 
     assert(typeOfIRExpr(irbb->tyenv, stmt->Ist.Put.data) == Ity_I32);
 
     return translate_put_reg_32(offset, data, irbb);
 }
 
-Exp  *arm_translate_ccall(IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+Exp *arm_translate_ccall(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
+    assert(expr);
+    assert(irbb);
+    assert(irout);
+
+    Exp *result = NULL;
+
     string func = string(expr->Iex.CCall.cee->name);
 
-    return new Unknown("CCall: " + func, regt_of_irexpr(irbb, expr));
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    if (func == "armg_calculate_condition")
+    {
+        int arg = -1;
+        IRExpr *cond_op = expr->Iex.CCall.args[0];     
+
+        /*
+            Get value of the condition type for armg_calculate_condition.
+            Example of VEX code:
+
+            t5 = GET:I32(72)
+            t4 = Or32(t5,0xC0:I32)
+            t6 = GET:I32(76)
+            t7 = GET:I32(80)
+            t8 = GET:I32(84)
+            t9 = armg_calculate_condition[mcx=0x9]{0xa6974280}(t4,t6,t7,t8):I32
+
+            ... where desired value is 0xC0:I32
+        */
+        if (cond_op->tag == Iex_RdTmp) 
+        {
+            IRTemp look_for = cond_op->Iex.RdTmp.tmp;
+
+            // enumerate VEX IR statements
+            for (int i = 0; i < irbb->stmts_used; i++)
+            {
+                IRStmt *st = irbb->stmts[i];
+
+                // check for desired temp register assignment
+                if (st->tag == Ist_WrTmp &&
+                    st->Ist.WrTmp.tmp == look_for &&
+                    st->Ist.WrTmp.data->tag == Iex_Binop &&
+                    st->Ist.WrTmp.data->Iex.Binop.op == Iop_Or32)
+                {
+                    IRExpr *e = st->Ist.WrTmp.data->Iex.Binop.arg2;
+
+                    // check for constant 2-nd argument of Iop_Or32
+                    if (e->tag == Iex_Const &&
+                        e->Iex.Const.con->tag == Ico_U32)
+                    {
+                        arg = (e->Iex.Const.con->Ico.U32 >> 4);
+                    }
+
+                    break;                    
+                }
+            }
+        }
+
+        if (arg == -1)
+        {
+            /* 
+                Unable to get CC_OP value from current IR block,
+                use value that was set in previous instructions instead.
+            */
+            arg = CC_OP_GET(context);
+        }
+
+        switch (arg)
+        {
+        case ARMCondEQ:
+
+            result = ecl(ZF);
+            break;
+
+        case ARMCondNE:
+
+            result = ex_not(ZF);
+            break;
+
+        case ARMCondHS:
+
+            result = ecl(CF);
+            break;
+
+        case ARMCondLO:
+
+            result = ex_not(CF);
+            break;
+
+        case ARMCondMI:
+
+            result = ecl(NF);
+            break;
+
+        case ARMCondPL:
+
+            result = ex_not(NF);
+            break;
+
+        case ARMCondVS:
+
+            return new Constant(REG_32, 0);
+            result = ecl(VF);
+            break;
+
+        case ARMCondVC:
+
+            result = ex_not(VF);
+            break;
+
+        case ARMCondHI:
+
+            result = _ex_and(ecl(CF), ex_not(ZF));
+            break;
+
+        case ARMCondLS:
+
+            result = _ex_or(ex_not(CF), ecl(ZF));
+            break;
+
+        case ARMCondGE:
+
+            result = ex_eq(NF, VF);
+            break;
+
+        case ARMCondLT:
+
+            result = ex_neq(NF, VF);
+            break;
+
+        case ARMCondGT:
+
+            result = _ex_and(ex_not(ZF), ex_eq(NF, VF));
+            break;
+
+        case ARMCondLE:
+
+            result = _ex_or(ecl(ZF), ex_neq(NF, VF));
+            break;
+
+        case ARMCondAL:
+
+            result = new Constant(REG_32, 1);
+            break;
+
+        case ARMCondNV:
+
+            result = new Constant(REG_32, 0);
+            break;
+
+        default:
+        
+            panic("Unrecognized condition for armg_calculate_condition");
+        }
+    }
+    else
+    {
+        result = new Unknown("CCall: " + func, regt_of_irexpr(irbb, expr));
+    }
+
+    delete NF;
+    delete ZF;
+    delete CF;
+    delete VF;
+
+    return result;
 }
 
-void  arm_modify_flags(bap_block_t *block)
+static vector<Stmt *> mod_eflags_copy(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2)
 {
-    // FIXME: implement this
+    vector<Stmt *> irout;
+
+    // v = (dep1 >> ARMG_CC_SHIFT_V) & 1
+    // c = (dep1 >> ARMG_CC_SHIFT_C) & 1
+    // z = (dep1 >> ARMG_CC_SHIFT_Z) & 1
+    // n = (dep1 >> ARMG_CC_SHIFT_N) & 1
+    panic("mod_eflags_copy");
+
+    return irout;
+}
+
+static vector<Stmt *> mod_eflags_add(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2)
+{
+    vector<Stmt *> irout;
+    Temp *res = mk_temp(REG_32, &irout);
+
+    // All the static constants we'll ever need
+    Constant c_0(REG_32, 0);
+    Constant c_31(REG_32, 31);
+
+    // The operation itself: res = dep1 + dep2
+    irout.push_back(new Move(res, ex_add(arg1, arg2), type));
+
+    // Calculate flags
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    // n = res >> 31
+    Exp *condNF = _ex_shr(ecl(res), ecl(&c_31));
+    set_flag(&irout, type, NF, condNF);
+
+    // z = res == 0
+    Exp *condZF = ex_eq(res, &c_0);
+    set_flag(&irout, type, ZF, condZF);
+
+    // c = res < dep1    
+    Exp *condCF = ex_lt(res, arg1);
+    set_flag(&irout, type, CF, condCF);
+
+    // v = ((res ^ dep1) & (res ^ dep2)) >> 31
+    Exp *condVF = _ex_shr(
+        _ex_and(
+            ex_xor(res, arg1), 
+            ex_xor(res, arg2)
+        ), 
+        ecl(&c_31)
+    );
+
+    set_flag(&irout, type, VF, condVF);
+
+    return irout;
+}
+
+static vector<Stmt *> mod_eflags_sub(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2)
+{
+    vector<Stmt *> irout;
+    Temp *res = mk_temp(REG_32, &irout);
+
+    // All the static constants we'll ever need
+    Constant c_0(REG_32, 0);
+    Constant c_1(REG_32, 1);
+    Constant c_31(REG_32, 31);
+
+    // The operation itself: res = dep1 - dep2
+    irout.push_back(new Move(res, ex_sub(arg1, arg2)));
+
+    // Calculate flags
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    // n = res >> 31
+    Exp *condNF = _ex_eq(_ex_shr(ecl(res), ecl(&c_31)), ecl(&c_1));
+    set_flag(&irout, type, NF, condNF);
+
+    // z = res == 0    
+    Exp *condZF = ex_eq(res, &c_0);
+    set_flag(&irout, type, ZF, condZF);
+
+    // c = dep1 >= dep2
+    Exp *condCF = ex_ge(arg1, arg2);
+    set_flag(&irout, type, CF, condCF);
+    
+    // v = ((dep1 ^ dep2) & (dep1 ^ res)) >> 31    
+    Exp *condVF = _ex_eq(
+        _ex_shr(
+            _ex_and(
+                ex_xor(arg1, arg2), 
+                ex_xor(arg1, res)
+            ), 
+            ecl(&c_31)
+        ), 
+        ecl(&c_1)
+    );
+
+    set_flag(&irout, type, VF, condVF);
+
+    return irout;
+}
+
+static vector<Stmt *> mod_eflags_adc(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3)
+{
+    vector<Stmt *> irout;
+    Temp *res = mk_temp(REG_32, &irout);
+
+    // The operation itself
+    irout.push_back(new Move(res, _ex_add(ex_add(arg1, arg2), ecl(arg3))));
+
+    // Calculate flags
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    // res = dep1 + dep2 + dep3  
+    // v = ((res ^ dep1) & (res ^ dep2)) >> 31
+    // c = dep3 ? (res <= dep1) : (res < dep1)
+    // z = res == 0
+    // n = res >> 31
+    panic("mod_eflags_adc");
+
+    return irout;
+}
+
+static vector<Stmt *> mod_eflags_sbb(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3)
+{
+    vector<Stmt *> irout;
+    Temp *res = mk_temp(REG_32, &irout);
+
+    // All the static constants we'll ever need
+    Constant c_1(REG_32, 1);
+
+    // The operation itself
+    irout.push_back(new Move(res, _ex_sub(ex_sub(arg1, arg2), ex_xor(arg3, &c_1))));
+
+    // res = dep1 - dep2 - (dep3 ^ 1)
+    // v = ((dep1 ^ dep2) & (dep1 ^ res)) >> 31
+    // c = dep3 ? (dep1 >= dep2) : (dep1 > dep2);
+    // z = res == 0
+    // n = res >> 31
+    panic("mod_eflags_sbb");
+
+    return irout;
+}
+
+static vector<Stmt *> mod_eflags_logic(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2)
+{
+    vector<Stmt *> irout;
+
+    // Calculate flags
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    // v = dep3
+    // c = dep2
+    // z = dep1 == 0
+    // n = dep1 >> 31
+    panic("mod_eflags_logic");
+
+    return irout;
+}
+
+static vector<Stmt *> mod_eflags_umul(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2)
+{
+    vector<Stmt *> irout;
+
+    // Calculate flags
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    // v = (dep3 >> 0) & 1
+    // c = (dep3 >> 1) & 1
+    // z = dep1 == 0
+    // n = dep1 >> 31
+    panic("mod_eflags_umul");
+
+    return irout;
+}
+
+static vector<Stmt *> mod_eflags_umull(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3)
+{
+    vector<Stmt *> irout;
+
+    // Calculate flags
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    // v = (dep3 >> 0) & 1
+    // c = (dep3 >> 1) & 1
+    // z = (dep1 | dep2) == 0
+    // n = dep2 >> 31
+    panic("mod_eflags_umull");
+
+    return irout;
+}
+
+void arm_modify_flags(bap_context_t *context, bap_block_t *block)
+{
+    assert(block);
+
+    vector<Stmt *> *ir = block->bap_ir;
+    int opi = -1, dep1 = -1, dep2 = -1, ndep = -1, mux0x = -1;
+
+    // Look for occurrence of CC_OP assignment
+    // These will have the indices of the CC_OP stmts
+    get_thunk_index(ir, &opi, &dep1, &dep2, &ndep, &mux0x);
+
+    if (opi == -1)        
+    {
+        // doesn't set flags
+        return;
+    }
+
+    Stmt *op_stmt = ir->at(opi);
+    bool got_op = false;
+    int op = 0;
+
+    if (op_stmt->stmt_type == MOVE)
+    {
+        Move *op_mov = (Move *)op_stmt;
+
+        if (!(op_mov->rhs->exp_type == CONSTANT))
+        {
+            got_op = false;
+        }
+        else
+        {
+            Constant *op_const = (Constant *)op_mov->rhs;
+            op = op_const->val;
+            got_op = true;
+        }
+    }
+
+    if (got_op)
+    {
+        Mod_Func_0 *cb = NULL;
+        int num_params = 0;
+
+        switch (op) 
+        {
+        case ARMG_CC_OP_COPY: 
+
+            num_params = 2;
+            cb = (Mod_Func_0 *)mod_eflags_copy;
+            break;
+        
+        case ARMG_CC_OP_ADD: 
+            
+            num_params = 2;
+            cb = (Mod_Func_0 *)mod_eflags_add;
+            break;
+          
+        case ARMG_CC_OP_SUB: 
+            
+            num_params = 2;
+            cb = (Mod_Func_0 *)mod_eflags_sub;
+            break;
+
+        case ARMG_CC_OP_ADC: 
+            
+            num_params = 3;
+            cb = (Mod_Func_0 *)mod_eflags_adc;
+            break;
+
+        case ARMG_CC_OP_SBB: 
+            
+            num_params = 3;
+            cb = (Mod_Func_0 *)mod_eflags_sbb;
+            break;
+          
+        case ARMG_CC_OP_LOGIC: 
+            
+            num_params = 2;
+            cb = (Mod_Func_0 *)mod_eflags_logic;
+            break;
+
+        case ARMG_CC_OP_MUL: 
+            
+            num_params = 2;
+            cb = (Mod_Func_0 *)mod_eflags_umul;
+            break;
+
+        case ARMG_CC_OP_MULL: 
+            
+            num_params = 3;
+            cb = (Mod_Func_0 *)mod_eflags_umull;
+            break;
+
+        default:
+         
+            panic("unhandled cc_op!");
+        }
+
+        if (cb)
+        {
+            string op = block->str_mnem;
+
+            modify_eflags_helper(context, op, REG_32, ir, num_params, cb);
+        }
+        else
+        {
+            panic("eflags handler is not set!");   
+        }
+    }
 }
 

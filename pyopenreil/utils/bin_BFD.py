@@ -6,23 +6,30 @@ test_dir = os.path.abspath(os.path.join(file_dir, '..', '..', 'tests'))
 
 from pyopenreil import REIL
 
-MAX_INST_LEN = 30
-
 class Reader(REIL.Reader):
 
-    def __init__(self, path):
+    def __init__(self, path, arch = None):
 
         # load image
         self.bfd = pybfd.bfd.Bfd(path)
+        self.arch = arch        
 
-        try:
+        if self.arch is None:
 
-            # get REIL arch by file arch
-            self.arch = { pybfd.bfd.ARCH_I386: REIL.ARCH_X86 }[ self.bfd.architecture ]
-        
-        except KeyError:
+            if self.bfd.architecture == 0:
 
-            raise Exception('Unsupported architecture')
+                # because bfd is piece of shit
+                raise Exception('Unknown bfd architecture, you also may try to specify it manually')
+
+            try:
+
+                # get REIL arch by file arch
+                # FIXME: check for arm as well
+                self.arch = { pybfd.bfd.ARCH_I386: REIL.ARCH_X86 }[ self.bfd.architecture ]
+            
+            except KeyError:
+
+                raise Exception('Unsupported architecture %s' % self.bfd.architecture_name)
 
         super(REIL.Reader, self).__init__()
 
@@ -42,7 +49,7 @@ class Reader(REIL.Reader):
 
     def read_insn(self, addr): 
 
-        return self.read(addr, MAX_INST_LEN)
+        return self.read(addr, REIL.MAX_INST_LEN)
 
 
 class TestBFD(unittest.TestCase):

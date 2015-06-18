@@ -1,18 +1,13 @@
-/*
- Owned and copyright BitBlaze, 2007. All rights reserved.
- Do not copy, disclose, or distribute without explicit written
- permission.
-*/
-#ifndef _STMT_H
-#define _STMT_H
+#ifndef STMT_H
+#define STMT_H
 
 #include "irvisitor.h"
 #include "exp.h"
 
-enum cval_type_t {NONE, BOOL, CHR, INT_16, INT_32, INT_64, INT_128};
+enum cval_type_t { NONE, BOOL, CHR, INT_16, INT_32, INT_64, INT_128 };
 
-enum stmt_type_t {JMP, CJMP, SPECIAL, MOVE,  COMMENT,  LABEL, EXPSTMT, VARDECL,
-                  CALL, RETURN, FUNCTION, ASSERT };
+enum stmt_type_t { JMP, CJMP, SPECIAL, MOVE,  COMMENT,  LABEL, EXPSTMT, VARDECL,
+                   CALL, RETURN, FUNCTION, ASSERT };
 
 #ifndef __cplusplus
 typedef struct Stmt Stmt;

@@ -1,4 +1,4 @@
-import json, base64, unittest, copy
+import sys, os, json, base64, unittest, copy
 from abc import ABCMeta, abstractmethod
 from sets import Set
 
@@ -7,10 +7,36 @@ from IR import *
 from symbolic import *
 
 # supported arhitectures
-from arch import x86
+from arch import x86, arm
 
 # architecture constants
 ARCH_X86 = 0
+ARCH_ARM = 1
+
+
+LOG_MASK = None
+LOG_PATH = None
+
+# translator logging options
+def log_init(log_mask, log_path = None):
+
+    global LOG_MASK, LOG_PATH
+
+    LOG_MASK, LOG_PATH = log_mask, log_path
+
+
+def log_get():
+
+    global LOG_MASK, LOG_PATH
+
+    log_mask, log_path = LOG_MASK, LOG_PATH
+
+    env_path = os.getenv('REIL_LOG_PATH')
+    env_mask = os.getenv('REIL_LOG_MASK')
+    log_path = log_path if env_path is None else env_path
+    log_mask = log_mask if env_mask is None else int(env_mask, 16)
+
+    return log_mask, log_path    
 
 
 class Error(Exception):
@@ -51,7 +77,8 @@ def get_arch(arch):
 
     try: 
 
-        return { ARCH_X86: x86 }[ arch ]
+        return { ARCH_X86: x86, 
+                 ARCH_ARM: arm }[ arch ]
 
     except KeyError: 
 
@@ -428,22 +455,19 @@ class Insn(object):
 
                 c = c if self.c.type == A_CONST else out_state[c]
 
+                if isinstance(c, SymConst):
+
+                    # make IR addr from numeric constant
+                    c = SymIRAddr(c.val, 0)
+
                 if self.a.type == A_CONST:
 
                     # unconditional
                     if self.a.get_val() != 0: out_state.update(SymIP(), c)
 
-                else:
+                else:                    
 
-                    if self.has_attr(IATTR_NEXT):
-
-                        next = self.get_attr(IATTR_NEXT)[0]
-
-                    else:
-
-                        next = self.addr + self.size
-
-                    true, false = c, SymConst(next, U32)
+                    true, false = c, SymIRAddr(*self.next())
                     assert true is not None and false is not None
 
                     # conditional
@@ -476,12 +500,12 @@ class Insn(object):
         elif self.has_flag(IOPT_ASM_END):
 
             # go to first IR instruction of next assembly instruction
-            return self.next_asm(), 0
+            return self.IRAddr(( self.next_asm(), 0 ))
 
         else:
 
             # go to next IR instruction of current assembly instruction
-            return self.addr, self.inum + 1
+            return self.IRAddr(( self.addr, self.inum + 1 ))
 
     def next_asm(self):
 
@@ -490,8 +514,13 @@ class Insn(object):
 
     def jcc_loc(self):
 
-        if self.op == I_JCC and self.c.type == A_CONST: return self.c.get_val(), 0
-        return None
+        if self.op == I_JCC and self.c.type == A_CONST: 
+
+            return self.IRAddr(( self.c.get_val(), 0 ))
+
+        else:
+
+            return None
 
     def clone(self):
 
@@ -720,6 +749,10 @@ class InsnList(list):
 
         return '\n'.join(map(lambda insn: insn.to_str(show_asm = True, show_bin = True), self)) + '\n'
 
+    def sort(self):
+
+        super(InsnList, self).sort(key = lambda insn: insn.ir_addr())
+
     def get_range(self, first, last = None):
 
         if len(self) == 0: return InsnList()
@@ -884,8 +917,8 @@ class TestBasicBlock(unittest.TestCase):
         lhs, rhs = bb.get_successors()
 
         # check for valid next instructions of JNE
-        assert lhs == Insn.IRAddr(( 0, 3 ))
-        assert rhs == Insn.IRAddr(( 2, 0 ))
+        assert lhs == Insn.IRAddr(( tr.get_insn(( 0, 0 )).size, 0 ))
+        assert rhs == Insn.IRAddr(( tr.get_insn(( 0, 0 )).size + 1, 0 ))
 
 
 class Func(InsnList):
@@ -1372,6 +1405,7 @@ class CFGraphBuilder(object):
 
             # process immediate postdominators
             lhs, rhs = bb.last.next(), bb.last.jcc_loc()
+
             if rhs is not None: 
 
                 _process_edge(( bb.ir_addr, rhs ))
@@ -2425,6 +2459,16 @@ class TestCodeStorageMem(unittest.TestCase):
 
 class CodeStorageTranslator(CodeStorage):
 
+    #
+    # OpenREIL (as well as VEX) uses the least significant bit of 
+    # address to determinate encoding mode for ARM instruction:
+    # 0 -- it's regular ARM instruction, 1 -- it's Thumb instruction.
+    #
+    _arm_addr_decode = lambda self, addr: ( addr & 0xfffffffffffffffe, addr & 1 )
+
+    # Thumb enable helper
+    arm_thumb = lambda self, addr: addr | 1
+
     class CFGraphBuilderFunc(CFGraphBuilder):
 
         def process_node(self, bb, state, context):
@@ -2437,6 +2481,8 @@ class CodeStorageTranslator(CodeStorage):
 
             CFGraphBuilder.traverse(self, ir_addr)
 
+            self.func.sort()
+
     def __init__(self, reader = None, storage = None):        
 
         arch = None
@@ -2447,26 +2493,59 @@ class CodeStorageTranslator(CodeStorage):
         else: raise Error('Storage or reader instance must be specified')
 
         import translator
-        self.translator = translator.Translator(arch)
+        
+        log_mask, log_path = log_get()
+        log_mask = log_mask if log_mask is not None else translator.LOG_MASK_DEFAULT
+
+        self.translator = translator.Translator(arch, log_path = log_path, \
+                                                      log_mask = log_mask)
         
         self.arch = get_arch(arch)        
         self.storage = CodeStorageMem(arch) if storage is None else storage
         self.reader = reader
 
-    def translate_insn(self, data, addr):                
+    def translate_insn(self, data, addr):           
 
-        src, dst = [], []
-        unk_insn = Insn(I_UNK, ir_addr = ( addr, 0 ))
-        unk_insn.set_flag(IOPT_ASM_END)        
+        src, dst = [], []        
 
         # generate IR instructions
-        ret = self.translator.to_reil(data, addr = addr)
+        ret = self.translator.to_reil(data, addr = addr)        
+
+        #
+        # Represent Cjmp + Jmp (libasmir artifact) as Not + Cjmp.
+        #
+        if len(ret) > 2 and \
+           Insn_op(ret[-1]) == I_JCC and \
+           Insn_op(ret[-2]) == I_JCC:
+
+            jcc_1 = Insn(ret[-2])
+            jcc_2 = Insn(ret[-1])
+
+            if jcc_1.a.type == A_TEMP and \
+               jcc_1.c.type == A_CONST and jcc_1.c.get_val() == jcc_1.addr + jcc_1.size and \
+               jcc_2.a.type == A_CONST and jcc_2.a.get_val() != 0 and \
+               jcc_2.c.type == A_CONST and jcc_2.c.get_val() != jcc_2.addr + jcc_2.size:
+
+                # allocate new temp register
+                num = int(jcc_1.a.name[2:])
+                tmp = Arg(A_TEMP, jcc_1.a.size, 'V_%.2d' % (num + 1))
+
+                ret = ret[:len(ret) - 2]
+
+                ret.append(Insn(op = I_NOT, ir_addr = jcc_1.ir_addr(), size = jcc_1.size, 
+                                a = jcc_1.a, c = tmp).serialize())
+
+                ret.append(Insn(op = I_JCC, ir_addr = jcc_2.ir_addr(),  size = jcc_2.size,
+                                a = tmp, c = jcc_2.c, attr = jcc_2.attr).serialize())
 
         #
         # Convert untranslated instruction representation into the 
         # single I_NONE IR instruction and save operands information
         # into it's attributes.
         #
+        unk_insn = Insn(I_UNK, ir_addr = ( addr, 0 ))
+        unk_insn.set_flag(IOPT_ASM_END)        
+
         for insn in ret:
 
             if Insn_inum(insn) == 0:
@@ -2502,30 +2581,47 @@ class CodeStorageTranslator(CodeStorage):
 
         return self.storage.size()
 
-    def get_insn(self, ir_addr):
+    def get_insn(self, ir_addr):        
 
         ir_addr = ir_addr if isinstance(ir_addr, tuple) else (ir_addr, None)
-        ret = InsnList()
+        addr, inum, arm_thumb = ir_addr[0], ir_addr[1], 0
 
-        try: 
+        if self.arch == arm:
+
+            # clear least significant bit of instruction address in case of ARM
+            arm_addr, arm_thumb = self._arm_addr_decode(ir_addr[0])
+            ir_addr = ( arm_addr, inum )
+
+        try:             
 
             # query already translated IR instructions for this address
             return self.storage.get_insn(ir_addr)
 
         except StorageError:
 
-            if self.reader is None: raise ReadError(ir_addr[0])
+            pass
 
-            # read instruction bytes from memory
-            data = self.reader.read_insn(ir_addr[0])
-            if data is None: raise ReadError(ir_addr[0])
+        mem_addr = ir_addr[0]
+        if self.reader is None: raise ReadError(mem_addr)
 
-            # translate to REIL
-            ret = self.translate_insn(data, ir_addr[0])
+        # read instruction bytes from memory
+        data = self.reader.read_insn(mem_addr)
+        if data is None: raise ReadError(mem_addr)
 
-        # save to storage
-        for insn in ret: self.storage.put_insn(insn)
-        return self.storage.get_insn(ir_addr)
+        #
+        # Translate to REIL.
+        # Please note, that in case of ARM we need to pass 
+        # a memory address with thumb enabled/disabled bit included.
+        #
+        ret = InsnList()
+
+        for insn in self.translate_insn(data, addr):
+
+            # save translated instructions
+            self.storage.put_insn(insn)
+            ret.append(Insn(insn))
+
+        return ret
 
     def put_insn(self, insn_or_insn_list):
 
@@ -2581,9 +2677,30 @@ class TestCodeStorageTranslator(unittest.TestCase):
 
         # test with reader + storage
         tr = CodeStorageTranslator(reader, storage)
-        assert tr.arch == x86 and tr.get_insn(0) == insn_list
+        assert tr.arch == x86 and tr.get_insn(0) == insn_list    
 
-    def test_unknown_insn_x86(self):
+    def test_get_insn(self):
+
+        print '\n', self.tr.get_insn(0)
+
+    def test_get_bb(self):
+
+        print '\n', self.tr.get_bb(0)
+
+    def test_get_func(self):
+
+        print '\n', self.tr.get_func(0)    
+
+
+class TestArchX86(unittest.TestCase):
+
+    arch = ARCH_X86
+
+    def setUp(self):        
+
+        pass
+
+    def test_unknown_insn(self):
 
         from pyopenreil.utils import asm
 
@@ -2591,6 +2708,8 @@ class TestCodeStorageTranslator(unittest.TestCase):
 
             tr = CodeStorageTranslator(asm.Reader(self.arch, code))
             insn = tr.get_insn(0)
+
+            print insn
 
             # check for single IR instruction
             assert len(insn) == 1
@@ -2668,19 +2787,65 @@ class TestCodeStorageTranslator(unittest.TestCase):
         assert _check_args(insn.get_attr(IATTR_SRC), [ 'R_ECX', 'R_LDT' ])
         assert not insn.has_attr(IATTR_DST)
 
-    def test_get_insn(self):
+    def test_seg_access(self):
 
-        print '\n', self.tr.get_insn(0)
+        from pyopenreil.utils import asm
 
-    def test_get_bb(self):
+        code = ( 'mov edi, dword ptr fs:[0x30]', 
+                 'mov esi, dword ptr fs:[ecx]',
+                 'mov dword ptr fs:[0x30], edx', 
+                 'mov dword ptr fs:[ecx], edx', 
+                 'ret' )
 
-        print '\n', self.tr.get_bb(0)
+        tr = CodeStorageTranslator(asm.Reader(self.arch, code))
 
-    def test_get_func(self):
+        bb = tr.get_bb(0)
 
-        print '\n', self.tr.get_func(0)    
+        print bb
 
- 
+        # get symbolic expressions for given bb
+        sym = bb.to_symbolic(temp_regs = False)
+
+        fs_base = SymVal('R_FS_BASE', U32)        
+
+        assert len(sym.state) == 6
+        
+        assert sym.get(SymVal('R_EDI', U32)) == SymPtr(fs_base + SymConst(0x30, U32))
+        assert sym.get(SymVal('R_ESI', U32)) == SymPtr(fs_base + SymVal('R_ECX', U32))
+
+        assert sym.get(SymPtr(fs_base + SymConst(0x30, U32))) == SymVal('R_EDX', U32)
+        assert sym.get(SymPtr(fs_base + SymVal('R_ECX', U32))) == SymVal('R_EDX', U32)
+
+
+class TestArchArm(unittest.TestCase):
+
+    arch = ARCH_ARM
+
+    def setUp(self):        
+
+        pass
+
+    def test_asm_arm(self):
+
+        from pyopenreil.utils import asm
+
+        code = (
+            'push    {r7}',
+            'cmp     r0, #0',
+            'moveq   r1, #1', # if r0 == 0
+            'moveq   r2, #1', # if r0 == 0
+            'movne   r1, #0', # if r0 != 0
+            'movne   r2, #0', # if r0 != 0
+            'pop     {r7}',
+            'mov     pc, lr' )
+
+        reader = asm.Reader(self.arch, code)
+        tr = CodeStorageTranslator(reader)        
+
+        print repr(reader.data)
+        print tr.get_func(0)
+
+
 if __name__ == '__main__':
 
     unittest.main(verbosity = 2)

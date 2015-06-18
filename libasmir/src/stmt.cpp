@@ -1,14 +1,11 @@
-/*
- Owned and copyright BitBlaze, 2007. All rights reserved.
- Do not copy, disclose, or distribute without explicit written
- permission.
-*/
-#include "stmt.h"
+#include <string>
 #include <iostream>
 #include <fstream>
 #include <assert.h>
 
 using namespace std;
+
+#include "stmt.h"
 
 Stmt *Stmt::clone(Stmt *s)
 {
@@ -101,6 +98,7 @@ void Stmt::destroy(Stmt *s)
     case SPECIAL:
     case LABEL:
     case VARDECL:
+    case ASSERT:
         
         break;
     }
@@ -538,5 +536,3 @@ Label *mk_label()
  
     return new Label("L_" + int_to_str(label_counter++));
 }
-
-
