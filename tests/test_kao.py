@@ -356,7 +356,7 @@ class Cpu(VM.Cpu):
             raise Exception('I_JCC with symbolic condition at ' + 
                             '%s, giving up' % str(insn.ir_addr()))
 
-        elif c.val.is_symbolic():
+        elif c is not None and c.val.is_symbolic():
 
             raise Exception('I_JCC with symbolic location at ' + 
                             '%s, giving up' % str(insn.ir_addr()))
@@ -463,10 +463,9 @@ def keygen(kao_binary_path, kao_installation_ID):
     from pyopenreil.utils import bin_PE        
     tr = CodeStorageTranslator(bin_PE.Reader(kao_binary_path))
 
-    # Construct DFG, run all available code optimizations
-    # and update storage with new function code.
-    dfg = DFGraphBuilder(tr).traverse(check_serial)
-    dfg.optimize_all(tr.storage)        
+    # Run all available code optimizations and 
+    # update storage with new the function code.
+    tr.optimize(check_serial)     
 
     print tr.get_func(check_serial)
 
@@ -483,8 +482,8 @@ def keygen(kao_binary_path, kao_installation_ID):
         # convert installation ID into the binary form
         for s in kao_installation_ID.split('-'):
         
-            in_data += struct.pack('L', int(s[:8], 16))
-            in_data += struct.pack('L', int(s[8:], 16))
+            in_data += struct.pack('I', int(s[:8], 16))
+            in_data += struct.pack('I', int(s[8:], 16))
 
         assert len(in_data) == 32
 

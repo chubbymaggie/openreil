@@ -98,8 +98,8 @@ static vector<Stmt *> mod_eflags_add(bap_context_t *context, reg_t type, Exp *ar
 static vector<Stmt *> mod_eflags_sub(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2);
 static vector<Stmt *> mod_eflags_adc(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3);
 static vector<Stmt *> mod_eflags_sbb(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3);
-static vector<Stmt *> mod_eflags_logic(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2);
-static vector<Stmt *> mod_eflags_umul(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2);
+static vector<Stmt *> mod_eflags_logic(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3);
+static vector<Stmt *> mod_eflags_umul(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3);
 static vector<Stmt *> mod_eflags_umull(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3);
 
 vector<VarDecl *> arm_get_reg_decls()
@@ -131,9 +131,12 @@ vector<VarDecl *> arm_get_reg_decls()
     ret.push_back(new VarDecl("R_ZF",       r1));
     ret.push_back(new VarDecl("R_CF",       r1));
     ret.push_back(new VarDecl("R_VF",       r1));
-    ret.push_back(new VarDecl("CC_OP",      r32));
-    ret.push_back(new VarDecl("CC_DEP1",    r32));
-    ret.push_back(new VarDecl("CC_DEP2",    r32));
+    ret.push_back(new VarDecl("R_CC_OP",    r32));
+    ret.push_back(new VarDecl("R_CC_DEP1",  r32));
+    ret.push_back(new VarDecl("R_CC_DEP2",  r32));
+
+    // IT block condition
+    ret.push_back(new VarDecl("R_ITCOND",   r1));
 
     return ret;
 }
@@ -278,6 +281,36 @@ Stmt *arm_translate_put(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector
     return translate_put_reg_32(offset, data, irbb);
 }
 
+void arm_translate_ccall_args(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+{
+    // we need it for cleanup of CCall arguments
+    Internal *intr = new Internal(INTERNAL_VEX_FN_ARG_LIST, sizeof(internal_vex_fn_arg_list));
+    assert(intr);
+
+    // get pointer to arguments list structure
+    internal_vex_fn_arg_list *arg_list = (internal_vex_fn_arg_list *)intr->data;
+    assert(arg_list);
+
+    // enumerate VEX function arguments
+    for (int i = 0; i < 4; i++)
+    {
+        IRExpr *arg = expr->Iex.CCall.args[i];
+
+        // check for Temp argument
+        if (arg->tag == Iex_RdTmp) 
+        {
+            IRTemp temp_arg = arg->Iex.RdTmp.tmp;
+
+            arg_list->args[arg_list->count].temp = temp_arg;
+            arg_list->args[arg_list->count].type = translate_tmp_type(context, irbb, arg);
+
+            arg_list->count += 1;
+        }
+    }
+
+    irout->push_back(intr);
+}
+
 Exp *arm_translate_ccall(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
@@ -332,7 +365,7 @@ Exp *arm_translate_ccall(bap_context_t *context, IRExpr *expr, IRSB *irbb, vecto
                     if (e->tag == Iex_Const &&
                         e->Iex.Const.con->tag == Ico_U32)
                     {
-                        arg = (e->Iex.Const.con->Ico.U32 >> 4);
+                        arg = e->Iex.Const.con->Ico.U32;
                     }
 
                     break;                    
@@ -346,80 +379,100 @@ Exp *arm_translate_ccall(bap_context_t *context, IRExpr *expr, IRSB *irbb, vecto
                 Unable to get CC_OP value from current IR block,
                 use value that was set in previous instructions instead.
             */
-            arg = CC_OP_GET(context);
+            arg = context->flag_thunks.op;
         }
+
+        /*
+            Get cond_n_op argument value in according to the VEX
+            implementation of the armg_calculate_condition():
+
+                UInt armg_calculate_condition ( UInt cond_n_op,
+                                    UInt cc_dep1,
+                                    UInt cc_dep2, UInt cc_dep3 )
+                {
+                   UInt cond  = cond_n_op >> 4;
+                   UInt cc_op = cond_n_op & 0xF;
+
+                   ... 
+
+                   switch (cond) {
+                      case ARMCondEQ:    // Z=1         => z
+                      case ARMCondNE:    // Z=0
+
+                   ...
+        */
+        arg >>= 4;
 
         switch (arg)
         {
         case ARMCondEQ:
 
-            result = ecl(ZF);
+            result = _ex_u_cast(ecl(ZF), REG_32);
             break;
 
         case ARMCondNE:
 
-            result = ex_not(ZF);
+            result = _ex_u_cast(ex_not(ZF), REG_32);
             break;
 
         case ARMCondHS:
 
-            result = ecl(CF);
+            result = _ex_u_cast(ecl(CF), REG_32);
             break;
 
         case ARMCondLO:
 
-            result = ex_not(CF);
+            result = _ex_u_cast(ex_not(CF), REG_32);
             break;
 
         case ARMCondMI:
 
-            result = ecl(NF);
+            result = _ex_u_cast(ecl(NF), REG_32);
             break;
 
         case ARMCondPL:
 
-            result = ex_not(NF);
+            result = _ex_u_cast(ex_not(NF), REG_32);
             break;
 
         case ARMCondVS:
 
-            return new Constant(REG_32, 0);
-            result = ecl(VF);
+            result = _ex_u_cast(ecl(VF), REG_32);
             break;
 
         case ARMCondVC:
 
-            result = ex_not(VF);
+            result = _ex_u_cast(ex_not(VF), REG_32);
             break;
 
         case ARMCondHI:
 
-            result = _ex_and(ecl(CF), ex_not(ZF));
+            result = _ex_u_cast(_ex_and(ecl(CF), ex_not(ZF)), REG_32);
             break;
 
         case ARMCondLS:
 
-            result = _ex_or(ex_not(CF), ecl(ZF));
+            result = _ex_u_cast(_ex_or(ex_not(CF), ecl(ZF)), REG_32);
             break;
 
         case ARMCondGE:
 
-            result = ex_eq(NF, VF);
+            result = _ex_u_cast(ex_eq(NF, VF), REG_32);
             break;
 
         case ARMCondLT:
 
-            result = ex_neq(NF, VF);
+            result = _ex_u_cast(ex_neq(NF, VF), REG_32);
             break;
 
         case ARMCondGT:
 
-            result = _ex_and(ex_not(ZF), ex_eq(NF, VF));
+            result = _ex_u_cast(_ex_and(ex_not(ZF), ex_eq(NF, VF)), REG_32);
             break;
 
         case ARMCondLE:
 
-            result = _ex_or(ecl(ZF), ex_neq(NF, VF));
+            result = _ex_u_cast(_ex_or(ecl(ZF), ex_neq(NF, VF)), REG_32);
             break;
 
         case ARMCondAL:
@@ -436,6 +489,37 @@ Exp *arm_translate_ccall(bap_context_t *context, IRExpr *expr, IRSB *irbb, vecto
         
             panic("Unrecognized condition for armg_calculate_condition");
         }
+
+        // create Internal with CCall arguments information
+        arm_translate_ccall_args(context, expr, irbb, irout);
+    }
+    else if (func == "armg_calculate_flag_n")
+    {
+        // create Internal with CCall arguments information
+        arm_translate_ccall_args(context, expr, irbb, irout);
+
+        result = _ex_u_cast(ecl(NF), REG_32);
+    }
+    else if (func == "armg_calculate_flag_z")
+    {
+        // create Internal with CCall arguments information
+        arm_translate_ccall_args(context, expr, irbb, irout);
+
+        result = _ex_u_cast(ecl(ZF), REG_32);
+    }
+    else if (func == "armg_calculate_flag_c")
+    {
+        // create Internal with CCall arguments information
+        arm_translate_ccall_args(context, expr, irbb, irout);
+
+        result = _ex_u_cast(ecl(CF), REG_32);
+    }
+    else if (func == "armg_calculate_flag_v")
+    {
+        // create Internal with CCall arguments information
+        arm_translate_ccall_args(context, expr, irbb, irout);
+
+        result = _ex_u_cast(ecl(VF), REG_32);
     }
     else
     {
@@ -454,11 +538,63 @@ static vector<Stmt *> mod_eflags_copy(bap_context_t *context, reg_t type, Exp *a
 {
     vector<Stmt *> irout;
 
+    // All the static constants we'll ever need
+    Constant c_0(REG_32, 0);
+    Constant c_1(REG_32, 1);
+    Constant c_ARMG_CC_SHIFT_N(REG_32, 31);
+    Constant c_ARMG_CC_SHIFT_Z(REG_32, 30);
+    Constant c_ARMG_CC_SHIFT_C(REG_32, 29);
+    Constant c_ARMG_CC_SHIFT_V(REG_32, 28);
+
+    // Calculate flags
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
     // v = (dep1 >> ARMG_CC_SHIFT_V) & 1
+    Exp *condVF = _ex_neq(
+        _ex_and(
+            _ex_shr(ecl(arg1), ecl(&c_ARMG_CC_SHIFT_V)), 
+            ecl(&c_1)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, VF, condVF);
+
     // c = (dep1 >> ARMG_CC_SHIFT_C) & 1
+    Exp *condCF = _ex_neq(
+        _ex_and(
+            _ex_shr(ecl(arg1), ecl(&c_ARMG_CC_SHIFT_C)), 
+            ecl(&c_1)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, CF, condCF);
+
     // z = (dep1 >> ARMG_CC_SHIFT_Z) & 1
+    Exp *condZF = _ex_neq(
+        _ex_and(
+            _ex_shr(ecl(arg1), ecl(&c_ARMG_CC_SHIFT_Z)), 
+            ecl(&c_1)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, ZF, condZF);
+
     // n = (dep1 >> ARMG_CC_SHIFT_N) & 1
-    panic("mod_eflags_copy");
+    Exp *condNF = _ex_neq(
+        _ex_and(
+            _ex_shr(ecl(arg1), ecl(&c_ARMG_CC_SHIFT_N)), 
+            ecl(&c_1)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, NF, condNF);
 
     return irout;
 }
@@ -482,7 +618,7 @@ static vector<Stmt *> mod_eflags_add(bap_context_t *context, reg_t type, Exp *ar
     Temp *VF = mk_reg("VF", REG_1);
 
     // n = res >> 31
-    Exp *condNF = _ex_shr(ecl(res), ecl(&c_31));
+    Exp *condNF = _ex_neq(_ex_shr(ecl(res), ecl(&c_31)), ecl(&c_0));
     set_flag(&irout, type, NF, condNF);
 
     // z = res == 0
@@ -494,12 +630,15 @@ static vector<Stmt *> mod_eflags_add(bap_context_t *context, reg_t type, Exp *ar
     set_flag(&irout, type, CF, condCF);
 
     // v = ((res ^ dep1) & (res ^ dep2)) >> 31
-    Exp *condVF = _ex_shr(
-        _ex_and(
-            ex_xor(res, arg1), 
-            ex_xor(res, arg2)
+    Exp *condVF = _ex_neq(
+        _ex_shr(
+            _ex_and(
+                ex_xor(res, arg1), 
+                ex_xor(res, arg2)
+            ), 
+            ecl(&c_31)
         ), 
-        ecl(&c_31)
+        ecl(&c_0)
     );
 
     set_flag(&irout, type, VF, condVF);
@@ -514,7 +653,6 @@ static vector<Stmt *> mod_eflags_sub(bap_context_t *context, reg_t type, Exp *ar
 
     // All the static constants we'll ever need
     Constant c_0(REG_32, 0);
-    Constant c_1(REG_32, 1);
     Constant c_31(REG_32, 31);
 
     // The operation itself: res = dep1 - dep2
@@ -527,7 +665,7 @@ static vector<Stmt *> mod_eflags_sub(bap_context_t *context, reg_t type, Exp *ar
     Temp *VF = mk_reg("VF", REG_1);
 
     // n = res >> 31
-    Exp *condNF = _ex_eq(_ex_shr(ecl(res), ecl(&c_31)), ecl(&c_1));
+    Exp *condNF = _ex_neq(_ex_shr(ecl(res), ecl(&c_31)), ecl(&c_0));
     set_flag(&irout, type, NF, condNF);
 
     // z = res == 0    
@@ -539,7 +677,7 @@ static vector<Stmt *> mod_eflags_sub(bap_context_t *context, reg_t type, Exp *ar
     set_flag(&irout, type, CF, condCF);
     
     // v = ((dep1 ^ dep2) & (dep1 ^ res)) >> 31    
-    Exp *condVF = _ex_eq(
+    Exp *condVF = _ex_neq(
         _ex_shr(
             _ex_and(
                 ex_xor(arg1, arg2), 
@@ -547,7 +685,7 @@ static vector<Stmt *> mod_eflags_sub(bap_context_t *context, reg_t type, Exp *ar
             ), 
             ecl(&c_31)
         ), 
-        ecl(&c_1)
+        ecl(&c_0)
     );
 
     set_flag(&irout, type, VF, condVF);
@@ -560,7 +698,11 @@ static vector<Stmt *> mod_eflags_adc(bap_context_t *context, reg_t type, Exp *ar
     vector<Stmt *> irout;
     Temp *res = mk_temp(REG_32, &irout);
 
-    // The operation itself
+    // All the static constants we'll ever need
+    Constant c_0(REG_32, 0);
+    Constant c_31(REG_32, 31);
+
+    // The operation itself: res = dep1 + dep2 + dep3  
     irout.push_back(new Move(res, _ex_add(ex_add(arg1, arg2), ecl(arg3))));
 
     // Calculate flags
@@ -569,12 +711,39 @@ static vector<Stmt *> mod_eflags_adc(bap_context_t *context, reg_t type, Exp *ar
     Temp *CF = mk_reg("CF", REG_1);
     Temp *VF = mk_reg("VF", REG_1);
 
-    // res = dep1 + dep2 + dep3  
     // v = ((res ^ dep1) & (res ^ dep2)) >> 31
+    Exp *condVF = _ex_neq(
+        _ex_shr(
+            _ex_and(
+                _ex_xor(ecl(res), ecl(arg1)), 
+                _ex_xor(ecl(res), ecl(arg2))
+            ),
+            ecl(&c_31)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, VF, condVF);
+
     // c = dep3 ? (res <= dep1) : (res < dep1)
+    Exp *condCF = _ex_neq(
+        emit_mux0x(
+            &irout, REG_32, arg3, 
+            ex_le(res, arg1), 
+            ex_lt(res, arg1)
+        ),
+        ecl(&c_0)
+    );  
+
+    set_flag(&irout, type, CF, condCF);
+
     // z = res == 0
+    Exp *condZF = _ex_eq(ecl(res), ecl(&c_0));
+
+    set_flag(&irout, type, ZF, condZF);
+
     // n = res >> 31
-    panic("mod_eflags_adc");
+    Exp *condNF = _ex_neq(_ex_shr(ecl(res), ecl(&c_31)), ecl(&c_0));
 
     return irout;
 }
@@ -585,24 +754,12 @@ static vector<Stmt *> mod_eflags_sbb(bap_context_t *context, reg_t type, Exp *ar
     Temp *res = mk_temp(REG_32, &irout);
 
     // All the static constants we'll ever need
+    Constant c_0(REG_32, 0);
     Constant c_1(REG_32, 1);
+    Constant c_31(REG_32, 31);    
 
-    // The operation itself
+    // The operation itself: res = dep1 - dep2 - (dep3 ^ 1)
     irout.push_back(new Move(res, _ex_sub(ex_sub(arg1, arg2), ex_xor(arg3, &c_1))));
-
-    // res = dep1 - dep2 - (dep3 ^ 1)
-    // v = ((dep1 ^ dep2) & (dep1 ^ res)) >> 31
-    // c = dep3 ? (dep1 >= dep2) : (dep1 > dep2);
-    // z = res == 0
-    // n = res >> 31
-    panic("mod_eflags_sbb");
-
-    return irout;
-}
-
-static vector<Stmt *> mod_eflags_logic(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2)
-{
-    vector<Stmt *> irout;
 
     // Calculate flags
     Temp *NF = mk_reg("NF", REG_1);
@@ -610,18 +767,84 @@ static vector<Stmt *> mod_eflags_logic(bap_context_t *context, reg_t type, Exp *
     Temp *CF = mk_reg("CF", REG_1);
     Temp *VF = mk_reg("VF", REG_1);
 
-    // v = dep3
-    // c = dep2
-    // z = dep1 == 0
-    // n = dep1 >> 31
-    panic("mod_eflags_logic");
+    // v = ((dep1 ^ dep2) & (dep1 ^ res)) >> 31
+    Exp *condVF = _ex_neq(
+        _ex_shr(
+            _ex_and(
+                _ex_xor(ecl(arg1), ecl(arg2)), 
+                _ex_xor(ecl(arg1), ecl(res))
+            ),
+            ecl(&c_31)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, VF, condVF);
+
+    // c = dep3 ? (dep1 >= dep2) : (dep1 > dep2);
+    Exp *condCF = _ex_neq(
+        emit_mux0x(
+            &irout, REG_32, arg3, 
+            ex_ge(arg1, arg2), 
+            ex_gt(arg1, arg2)
+        ),
+        ecl(&c_0)
+    );  
+
+    set_flag(&irout, type, CF, condCF);
+
+    // z = res == 0
+    Exp *condZF = _ex_eq(ecl(res), ecl(&c_0));
+
+    set_flag(&irout, type, ZF, condZF);
+
+    // n = res >> 31
+    Exp *condNF = _ex_neq(_ex_shr(ecl(res), ecl(&c_31)), ecl(&c_0));
+
+    set_flag(&irout, type, NF, condNF);
 
     return irout;
 }
 
-static vector<Stmt *> mod_eflags_umul(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2)
+static vector<Stmt *> mod_eflags_logic(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3)
 {
     vector<Stmt *> irout;
+
+    // All the static constants we'll ever need
+    Constant c_0(REG_32, 0);
+    Constant c_31(REG_32, 31);
+
+    // Calculate flags
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    // n = dep1 >> 31
+    Exp *condNF = _ex_neq(_ex_shr(ecl(arg1), ecl(&c_31)), ecl(&c_0));
+    set_flag(&irout, type, NF, condNF);
+
+    // z = dep1 == 0
+    Exp *condZF = ex_eq(arg1, &c_0);
+    set_flag(&irout, type, ZF, condZF);
+
+    // c = dep2
+    set_flag(&irout, type, CF, _ex_neq(ecl(arg2), ecl(&c_0)));
+
+    // v = dep3
+    set_flag(&irout, type, VF, _ex_neq(ecl(arg3), ecl(&c_0)));
+
+    return irout;
+}
+
+static vector<Stmt *> mod_eflags_umul(bap_context_t *context, reg_t type, Exp *arg1, Exp *arg2, Exp *arg3)
+{
+    vector<Stmt *> irout;
+
+    // All the static constants we'll ever need
+    Constant c_0(REG_32, 0);
+    Constant c_1(REG_32, 1);
+    Constant c_31(REG_32, 31);
 
     // Calculate flags
     Temp *NF = mk_reg("NF", REG_1);
@@ -630,10 +853,36 @@ static vector<Stmt *> mod_eflags_umul(bap_context_t *context, reg_t type, Exp *a
     Temp *VF = mk_reg("VF", REG_1);
 
     // v = (dep3 >> 0) & 1
+    Exp *condVF = _ex_neq(
+        _ex_and(
+            _ex_shr(ecl(arg3), ecl(&c_0)), 
+            ecl(&c_1)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, VF, condVF);
+
     // c = (dep3 >> 1) & 1
+    Exp *condCF = _ex_neq(
+        _ex_and(
+            _ex_shr(ecl(arg3), ecl(&c_1)), 
+            ecl(&c_1)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, CF, condCF);
+    
     // z = dep1 == 0
+    Exp *condZF = _ex_eq(ecl(arg1), ecl(&c_0));
+
+    set_flag(&irout, type, ZF, condZF);
+
     // n = dep1 >> 31
-    panic("mod_eflags_umul");
+    Exp *condNF = _ex_neq(_ex_shr(ecl(arg1), ecl(&c_31)), ecl(&c_0));
+
+    set_flag(&irout, type, NF, condNF);
 
     return irout;
 }
@@ -642,6 +891,11 @@ static vector<Stmt *> mod_eflags_umull(bap_context_t *context, reg_t type, Exp *
 {
     vector<Stmt *> irout;
 
+    // All the static constants we'll ever need
+    Constant c_0(REG_32, 0);
+    Constant c_1(REG_32, 1);
+    Constant c_31(REG_32, 31);
+
     // Calculate flags
     Temp *NF = mk_reg("NF", REG_1);
     Temp *ZF = mk_reg("ZF", REG_1);
@@ -649,10 +903,36 @@ static vector<Stmt *> mod_eflags_umull(bap_context_t *context, reg_t type, Exp *
     Temp *VF = mk_reg("VF", REG_1);
 
     // v = (dep3 >> 0) & 1
+    Exp *condVF = _ex_neq(
+        _ex_and(
+            _ex_shr(ecl(arg3), ecl(&c_0)), 
+            ecl(&c_1)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, VF, condVF);
+
     // c = (dep3 >> 1) & 1
+    Exp *condCF = _ex_neq(
+        _ex_and(
+            _ex_shr(ecl(arg3), ecl(&c_1)), 
+            ecl(&c_1)
+        ), 
+        ecl(&c_0)
+    );
+
+    set_flag(&irout, type, CF, condCF);
+    
     // z = (dep1 | dep2) == 0
+    Exp *condZF = _ex_eq(_ex_or(ecl(arg1), ecl(arg2)), ecl(&c_0));
+
+    set_flag(&irout, type, ZF, condZF);
+
     // n = dep2 >> 31
-    panic("mod_eflags_umull");
+    Exp *condNF = _ex_neq(_ex_shr(ecl(arg2), ecl(&c_31)), ecl(&c_0));
+
+    set_flag(&irout, type, NF, condNF);
 
     return irout;
 }
@@ -666,7 +946,7 @@ void arm_modify_flags(bap_context_t *context, bap_block_t *block)
 
     // Look for occurrence of CC_OP assignment
     // These will have the indices of the CC_OP stmts
-    get_thunk_index(ir, &opi, &dep1, &dep2, &ndep, &mux0x);
+    get_put_thunk(block, &opi, &dep1, &dep2, &ndep, &mux0x);
 
     if (opi == -1)        
     {
@@ -674,31 +954,49 @@ void arm_modify_flags(bap_context_t *context, bap_block_t *block)
         return;
     }
 
-    Stmt *op_stmt = ir->at(opi);
+    Stmt *stmt = ir->at(opi);
+    Mod_Func_0 *cb = NULL;
+    int num_params = 0, op = 0;
     bool got_op = false;
-    int op = 0;
 
-    if (op_stmt->stmt_type == MOVE)
+    if (stmt->stmt_type == MOVE)
     {
-        Move *op_mov = (Move *)op_stmt;
+        Move *move = (Move *)stmt;
 
-        if (!(op_mov->rhs->exp_type == CONSTANT))
+        if (move->rhs->exp_type == CONSTANT)
         {
-            got_op = false;
-        }
-        else
-        {
-            Constant *op_const = (Constant *)op_mov->rhs;
-            op = op_const->val;
+            Constant *constant = (Constant *)move->rhs;
+
+            op = (int)constant->val;
             got_op = true;
         }
-    }
+        else if (mux0x != -1)
+        {
+            Exp *cond = NULL, *exp0 = NULL, *expx = NULL, *res = NULL;
+
+            // check if mux0x was used for CC_OP
+            if (match_mux0x(ir, opi - MUX_SUB, &cond, &exp0, &expx, &res) >= 0)
+            {
+                Name *name = mk_dest_name(context->inst + context->inst_size);
+                Label *label = mk_label();
+
+                // insert conditional statement
+                ir->insert(ir->begin() + opi - MUX_SUB, label); 
+                ir->insert(ir->begin() + opi - MUX_SUB, new CJmp(ecl(cond), new Name(label->label), name));
+
+                if (exp0->exp_type == CONSTANT)
+                {
+                    Constant *constant = (Constant *)exp0;
+
+                    op = (int)constant->val;
+                    got_op = true;
+                }
+            }
+        }
+    }    
 
     if (got_op)
-    {
-        Mod_Func_0 *cb = NULL;
-        int num_params = 0;
-
+    {        
         switch (op) 
         {
         case ARMG_CC_OP_COPY: 
@@ -733,13 +1031,13 @@ void arm_modify_flags(bap_context_t *context, bap_block_t *block)
           
         case ARMG_CC_OP_LOGIC: 
             
-            num_params = 2;
+            num_params = 3;
             cb = (Mod_Func_0 *)mod_eflags_logic;
             break;
 
         case ARMG_CC_OP_MUL: 
             
-            num_params = 2;
+            num_params = 3;
             cb = (Mod_Func_0 *)mod_eflags_umul;
             break;
 
@@ -751,19 +1049,197 @@ void arm_modify_flags(bap_context_t *context, bap_block_t *block)
 
         default:
          
-            panic("unhandled cc_op!");
+            panic("unhandled CC_OP");
         }
 
-        if (cb)
-        {
-            string op = block->str_mnem;
-
-            modify_eflags_helper(context, op, REG_32, ir, num_params, cb);
-        }
-        else
-        {
-            panic("eflags handler is not set!");   
-        }
+        modify_eflags_helper(context, block, block->str_mnem, REG_1, num_params, cb);     
+    }
+    else
+    {
+        panic("unexpected CC_OP");   
     }
 }
 
+void arm_modify_itstate(bap_context_t *context, bap_block_t *block)
+{
+    assert(block);
+
+    vector<Stmt *> *ir = block->bap_ir;
+    int n = -1;
+
+    // Look for occurrence of ITSTATE assignment
+    get_put_itstate(block, &n);
+
+    if (n == -1)        
+    {
+        // doesn't set ITSTATE
+        return;
+    }
+
+    Stmt *stmt = ir->at(n);
+    uint32_t itstate = 0;
+
+    if (stmt->stmt_type == MOVE)
+    {
+        Move *move = (Move *)stmt;
+
+        if (move->rhs->exp_type == CONSTANT)
+        {
+            Constant *constant = (Constant *)move->rhs;
+
+            itstate = (uint32_t)constant->val;
+        }
+    }
+
+    // delete statements that sets ITSTATE
+    del_put_itstate(block, n);
+
+    if (itstate == 0)
+    {
+        // current instruction is outside of the IT block
+        return;
+    }
+
+    // get condition type from current ITSTATE lane
+    uint8_t lane = (uint8_t)itstate;    
+
+    ARMCondcode cond = (ARMCondcode)(((lane >> 4) & 0xF) ^ 0xE);
+
+    Exp *result = NULL;
+
+    Temp *NF = mk_reg("NF", REG_1);
+    Temp *ZF = mk_reg("ZF", REG_1);
+    Temp *CF = mk_reg("CF", REG_1);
+    Temp *VF = mk_reg("VF", REG_1);
+
+    Temp *ITCOND_1 = mk_reg("ITCOND_1", REG_1);
+    Temp *ITCOND_2 = mk_reg("ITCOND_2", REG_1);
+    Temp *ITCOND_3 = mk_reg("ITCOND_3", REG_1);
+    Temp *ITCOND_4 = mk_reg("ITCOND_4", REG_1);
+
+    switch (cond)
+    {
+    case ARMCondEQ:
+
+        result = ecl(ITCOND_2);
+        break;
+
+    case ARMCondNE:
+
+        result = ex_not(ITCOND_2);
+        break;
+
+    case ARMCondHS:
+
+        result = ecl(CF);
+        break;
+
+    case ARMCondLO:
+
+        result = ex_not(CF);
+        break;
+
+    case ARMCondMI:
+
+        result = ecl(NF);
+        break;
+
+    case ARMCondPL:
+
+        result = ex_not(NF);
+        break;
+
+    case ARMCondVS:
+
+        result = ecl(VF);
+        break;
+
+    case ARMCondVC:
+
+        result = ex_not(VF);
+        break;
+
+    case ARMCondHI:
+
+        result = _ex_and(ecl(CF), ex_not(ZF));
+        break;
+
+    case ARMCondLS:
+
+        result = _ex_or(ex_not(CF), ecl(ZF));
+        break;
+
+    case ARMCondGE:
+
+        result = ex_eq(NF, VF);
+        break;
+
+    case ARMCondLT:
+
+        result = ex_neq(ITCOND_1, ITCOND_4);
+        break;
+    
+    case ARMCondGT:
+
+        result = _ex_and(ex_not(ITCOND_2), ex_eq(ITCOND_1, ITCOND_4));
+        break;
+
+    case ARMCondLE:
+
+        result = _ex_or(ecl(ZF), ex_neq(NF, VF));
+        break;
+
+    case ARMCondAL:
+
+        result = new Constant(REG_1, 1);
+        break;
+
+    case ARMCondNV:
+
+        result = new Constant(REG_1, 0);
+        break;
+
+    default:
+
+        panic("arm_modify_itstate(): Unexpected condition");
+    }
+
+    Name *name = mk_dest_name(context->inst + context->inst_size);
+    Label *label = mk_label();
+
+    // insert conditional jump for IT block
+    ir->insert(ir->begin() + 1, label);
+    ir->insert(ir->begin() + 1, new CJmp(new UnOp(NOT, result), name, new Name(label->label)));
+
+    delete ITCOND_4;
+    delete ITCOND_3;
+    delete ITCOND_2;
+    delete ITCOND_1;
+
+    delete NF;
+    delete ZF;
+    delete CF;
+    delete VF;
+}
+
+void arm_modify_itstate_cond(bap_context_t *context, bap_block_t *block)
+{
+    assert(block);
+
+    vector<Stmt *> *ir = block->bap_ir;
+
+    if (block->str_mnem.find("it") == 0)
+    {
+        ir->insert(ir->begin() + 1, new Move(mk_reg("ITCOND_1", REG_1),
+                                             mk_reg("NF", REG_1)));
+
+        ir->insert(ir->begin() + 1, new Move(mk_reg("ITCOND_2", REG_1),
+                                             mk_reg("ZF", REG_1)));
+
+        ir->insert(ir->begin() + 1, new Move(mk_reg("ITCOND_3", REG_1),
+                                             mk_reg("CF", REG_1)));
+
+        ir->insert(ir->begin() + 1, new Move(mk_reg("ITCOND_4", REG_1),
+                                             mk_reg("VF", REG_1)));
+    }
+}

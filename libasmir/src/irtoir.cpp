@@ -23,7 +23,7 @@ bool use_simple_segments = 1;
 bool translate_calls_and_returns = 0;
 
 //
-// For labeling untranslated VEX IR instructions
+// For labeling VEX IR instructions that was not translated
 //
 string uTag = "Unknown: ";
 string sTag = "Skipped: ";
@@ -34,8 +34,11 @@ string sTag = "Skipped: ";
 //======================================================================
 Exp *emit_mux0x(vector<Stmt *> *irout, reg_t type, Exp *cond, Exp *exp0, Exp *expX);
 void insert_specials(bap_context_t *context, bap_block_t *block);
-void track_flag_thunks(bap_context_t *context, bap_block_t *block);
+
+void track_itstate(bap_context_t *context, bap_block_t *block);
+void track_flags(bap_context_t *context, bap_block_t *block);
 void modify_flags(bap_context_t *context, bap_block_t *block);
+
 void do_cleanups_before_processing(bap_context_t *context);
 
 
@@ -76,21 +79,38 @@ void set_call_return_translation(int value)
 void set_flag(vector<Stmt *> *irout, reg_t type, Temp *flag, Exp *cond)
 {
     // set flag directly to condition
-    //    irout->push_back( new Move(flag, emit_mux0x(irout, type, cond, ex_const(0), ex_const(1))) );
     irout->push_back(new Move(flag, cond));
 }
 
-void modify_eflags_helper(bap_context_t *context, string op, reg_t type, vector<Stmt *> *ir, int argnum, Mod_Func_0 *mod_eflags_func)
+Exp *modify_eflags_helper_mux0x(bap_block_t *block, int n)
 {
-    assert(ir);
+    assert(block);
+
+    Exp *ret = NULL;
+    vector<Stmt *> *ir = block->bap_ir;    
+
+    // check for mux0x
+    if (match_mux0x(ir, n - MUX_SUB, NULL, &ret, NULL, NULL) >= 0)
+    {
+        // return true branch
+        return ret;
+    }
+
+    return ((Move *)(ir->at(n)))->rhs;
+}
+
+void modify_eflags_helper(bap_context_t *context, bap_block_t *block, string op, reg_t type, int argnum, Mod_Func_0 *mod_eflags_func)
+{
+    assert(block);
     assert(argnum == 2 || argnum == 3);
-    assert(mod_eflags_func);
+    assert(mod_eflags_func);    
+    
+    vector<Stmt *> *ir = block->bap_ir;
+    int opi = -1, dep1 = -1, dep2 = -1, ndep = -1, mux0x = -1;
 
     // Look for occurrence of CC_OP assignment
     // These will have the indices of the CC_OP stmts
-    int opi, dep1, dep2, ndep, mux0x;
-    opi = dep1 = dep2 = ndep = mux0x = -1;
-    get_thunk_index(ir, &opi, &dep1, &dep2, &ndep, &mux0x);
+    get_put_thunk(block, &opi, &dep1, &dep2, &ndep, &mux0x);
 
     if (opi >= 0)
     {
@@ -99,8 +119,8 @@ void modify_eflags_helper(bap_context_t *context, string op, reg_t type, vector<
         if (argnum == 2)
         {
             // Get the arguments we need from these Stmt's
-            Exp *arg1 = ((Move *)(ir->at(dep1)))->rhs;
-            Exp *arg2 = ((Move *)(ir->at(dep2)))->rhs;
+            Exp *arg1 = modify_eflags_helper_mux0x(block, dep1);
+            Exp *arg2 = modify_eflags_helper_mux0x(block, dep2);
 
             // Do the translation
             // To figure out the type, we assume the rhs of the
@@ -111,20 +131,29 @@ void modify_eflags_helper(bap_context_t *context, string op, reg_t type, vector<
         }
         else // argnum == 3
         {
-            Exp *arg1 = ((Move *)(ir->at(dep1)))->rhs;
-            Exp *arg2 = ((Move *)(ir->at(dep2)))->rhs;
-            Exp *arg3 = ((Move *)(ir->at(ndep)))->rhs;
+            Exp *arg1 = modify_eflags_helper_mux0x(block, dep1);
+            Exp *arg2 = modify_eflags_helper_mux0x(block, dep2);
+            Exp *arg3 = modify_eflags_helper_mux0x(block, ndep);
 
             Mod_Func_3 *mod_func = (Mod_Func_3 *)mod_eflags_func;
             mods = mod_func(context, type, arg1, arg2, arg3);
         }
 
-        // Delete the thunk
-        int pos = del_put_thunk(ir, op, opi, dep1, dep2, ndep, mux0x);
-        
-        // Insert the eflags mods in this position
-        ir->insert(ir->begin() + pos, mods.begin(), mods.end());
-        ir->insert(ir->begin() + pos, new Comment("eflags thunk: " + op));
+        if (!use_eflags_thunks && !i386_op_is_very_broken(context->guest, op))
+        {
+            // Delete the thunk
+            int pos = del_put_thunk(block, opi, dep1, dep2, ndep, mux0x);
+            if (pos != -1)
+            {
+                // Insert the eflags mods in this position
+                ir->insert(ir->begin() + pos, mods.begin(), mods.end());
+                ir->insert(ir->begin() + pos, new Comment("eflags thunk: " + op));                
+            }
+            else
+            {
+                log_write(LOG_WARN, "del_put_thunk() fails for \"%s\"!", op.c_str());
+            }
+        }
     }
     else
     {
@@ -132,9 +161,77 @@ void modify_eflags_helper(bap_context_t *context, string op, reg_t type, vector<
     }
 }
 
+#define DEL_STMT_RHS 0 // match by rhs of MOVE statement
+#define DEL_STMT_LHS 1 // match by lhs of MOVE statement
+
+#define DEL_STMT_GET(_arg_, _move_) ((_arg_) ? (_move_)->lhs : (_move_)->rhs)
+
+int del_stmt(vector<Stmt *> *ir, int arg, bool del, vector<string> names)
+{
+    assert(ir);
+
+    vector<Stmt *> rv;
+    int ret = -1, len = 0;
+
+    for (vector<Stmt *>::iterator i = ir->begin(); i != ir->end(); i++)
+    {
+        Stmt *stmt = (*i);
+        rv.push_back(stmt);
+
+        len++;
+
+        if (stmt->stmt_type == MOVE)
+        {
+            Move *move = (Move *)stmt;
+
+            if (DEL_STMT_GET(arg, move)->exp_type == TEMP)
+            {
+                Temp *temp = (Temp *)DEL_STMT_GET(arg, move);
+                bool found = false;
+
+                for (vector<string>::iterator n = names.begin(); n != names.end(); n++)
+                {
+                    string name = (*n);
+
+                    if (temp->name == name)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (found)
+                {                    
+                    if (del)
+                    {
+                        // remove and free the statement
+                        Stmt::destroy(rv.back());
+                        rv.pop_back();
+
+                        len--;
+                    }                    
+
+                    // remember statement position
+                    ret = len;
+                }
+            }
+        }
+    }
+
+    ir->clear();
+    ir->insert(ir->begin(), rv.begin(), rv.end());
+
+    return ret;
+}
+
 void del_seg_selector_trash(bap_block_t *block)
 {
     assert(block);
+
+    vector<string> names;
+
+    names.push_back("R_LDT");
+    names.push_back("R_GDT");
 
     vector<Stmt *> rv;
     vector<Stmt *> *ir = block->bap_ir;
@@ -252,33 +349,10 @@ void del_seg_selector_trash(bap_block_t *block)
     {
         // Segment selector access was not found
         return;
-    }
-    
-    rv.clear();
+    }    
 
-    // Eliminate GDT and LDT access statements
-    for (int i = 0; i < ir->size(); i++)
-    {
-        Stmt *stmt = ir->at(i);
-        rv.push_back(stmt);
-
-        // Check for move from temp
-        if (stmt->stmt_type == MOVE && ((Move *)stmt)->rhs->exp_type == TEMP)
-        {
-            Temp *temp = (Temp *)((Move *)stmt)->rhs;
-
-            // Check for move from LDT and GDT
-            if (temp->name == "R_LDT" || temp->name == "R_GDT")
-            {
-                // remove and free the statement
-                Stmt::destroy(rv.back());
-                rv.pop_back();
-            }
-        }
-    }
-
-    ir->clear();
-    ir->insert(ir->begin(), rv.begin(), rv.end());
+    // eliminate LDT/GDT args of x86g_use_seg_selector
+    del_stmt(block->bap_ir, DEL_STMT_RHS, true, names);    
 
     rv.clear();
 
@@ -333,122 +407,147 @@ void del_seg_selector_trash(bap_block_t *block)
     ir->insert(ir->begin(), rv.begin(), rv.end());
 }
 
+void del_internal(bap_block_t *block)
+{
+    assert(block);
+
+    vector<string> names;
+
+    vector<Stmt *> rv;
+    vector<Stmt *> *ir = block->bap_ir;
+    
+    // Look for 'Internal' statements
+    for (int i = 0; i < ir->size(); i++)
+    {
+        Stmt *stmt = ir->at(i);       
+
+        if (stmt->stmt_type == INTERNAL)
+        {  
+            Internal *intr = (Internal *)stmt;
+
+            if (intr->type == INTERNAL_VEX_FN_ARG_LIST)
+            {
+                // get pointer to arguments list structure
+                internal_vex_fn_arg_list *arg_list = (internal_vex_fn_arg_list *)intr->data;
+                assert(arg_list);
+
+                for (int n = 0; n < arg_list->count; n++)
+                {
+                    string name = translate_tmp_name(NULL, 
+                        arg_list->args[n].type, 
+                        arg_list->args[n].temp
+                    );
+                    
+                    names.push_back(name);
+                }
+            }            
+
+            continue;
+        }
+
+        rv.push_back(stmt);
+    }
+
+    ir->clear();
+    ir->insert(ir->begin(), rv.begin(), rv.end());
+
+    // delete VEX function argument statements
+    del_stmt(block->bap_ir, DEL_STMT_LHS, true, names);    
+}
+
 void del_get_thunk(bap_block_t *block)
 {
     assert(block);
 
-    vector<Stmt *> rv;
+    vector<string> names;
+
+    names.push_back("R_CC_OP");
+    names.push_back("R_CC_DEP1");
+    names.push_back("R_CC_DEP2");
+    names.push_back("R_CC_NDEP");
+
+    // delete get thunks
+    del_stmt(block->bap_ir, DEL_STMT_RHS, true, names);    
+}
+
+bool del_put_thunk_mux0x(bap_block_t *block, int n, vector<string> &names)
+{
+    assert(block);
+
     vector<Stmt *> *ir = block->bap_ir;
-    string mnemonic = block->str_mnem;
 
-    if (i386_op_is_very_broken(mnemonic)) 
-    {       
-        return;
-    }
-
-    assert(ir);
-
-    for (vector<Stmt *>::iterator i = ir->begin(); i != ir->end(); i++)
+    if (match_mux0x(ir, n - MUX_SUB, NULL, NULL, NULL, NULL) >= 0)
     {
-        Stmt *stmt = (*i);
-        rv.push_back(stmt);
 
-        if (stmt->stmt_type == MOVE)
+#ifndef MUX_AS_CJMP
+
+        // check for temp + temp + move + move + move
+        if (ir->at(n - MUX_SUB + 0)->stmt_type == VARDECL &&
+            ir->at(n - MUX_SUB + 1)->stmt_type == VARDECL)
         {
-            Move *move = (Move *)stmt;
+            VarDecl *var1 = (VarDecl *)ir->at(n - MUX_SUB + 0);
+            VarDecl *var2 = (VarDecl *)ir->at(n - MUX_SUB + 1);
 
-            if (move->rhs->exp_type == TEMP)
+            names.push_back(var1->name);
+            names.push_back(var2->name);
+
+            if (ir->at(n - 1)->stmt_type == MOVE)
             {
-                Temp *temp = (Temp *)(move->rhs);
+                Move *move = (Move *)ir->at(n - 1);
 
-                if (temp->name.find("CC_OP") != string::npos || 
-                    temp->name.find("CC_DEP1") != string::npos || 
-                    temp->name.find("CC_DEP2") != string::npos || 
-                    temp->name.find("CC_NDEP") != string::npos)
+                if (move->rhs->exp_type == TEMP && move->lhs->exp_type == TEMP)
                 {
-                    // remove and free the statement
-                    Stmt::destroy(rv.back());
-                    rv.pop_back();
-                }
-            }
-        }
-    }
+                    Temp *rhs = (Temp *)move->rhs;
+                    Temp *lhs = (Temp *)move->lhs;
 
-    ir->clear();
-    ir->insert(ir->begin(), rv.begin(), rv.end());
-}
-
-int del_put_thunk(vector<Stmt *> *ir, string mnemonic, int opi, int dep1, int dep2, int ndep, int mux0x)
-{
-    assert(ir);
-    assert(opi >= 0 && dep1 >= 0 && dep2 >= 0 && ndep >= 0);
-
-    vector<Stmt *> rv;
-    int ret = -1, len = 0, j = 0;
-
-    // Delete statements assigning to flag thunk temps
-    for (vector<Stmt *>::iterator i = ir->begin(); i != ir->end(); i++, j++)
-    {
-        Stmt *stmt = (*i);
-        rv.push_back(stmt);
-
-        len++;
-
-        if (i386_op_is_very_broken(mnemonic))
-        {
-            // don't touch thunks for some of the broken instructions
-            continue;
-        }
-        
-        // find MOVE statement with TEMP lvar
-        if (stmt->stmt_type == MOVE)
-        {
-            Move *move = (Move *)stmt;
-
-            if (move->lhs->exp_type == TEMP)
-            {
-                Temp *temp = (Temp *)(move->lhs);
-
-                if (temp->name.find("CC_OP") != string::npos || 
-                    temp->name.find("CC_DEP1") != string::npos || 
-                    temp->name.find("CC_DEP2") != string::npos || 
-                    temp->name.find("CC_NDEP") != string::npos)
-                {                        
-                    // CC_OP, CC_DEP1, CC_DEP2, CC_NDEP are never set unless
-                    // use_eflags_thunks is true
-                    if (!use_eflags_thunks)
+                    if (rhs->name == var1->name)
                     {
-                        Stmt::destroy(rv.back());
-                        rv.pop_back();
-                        len--;
-                    }                    
-
-		    // remember flag last thunk position
-                    ret = len;
+                        names.push_back(lhs->name);
+                    }
                 }
             }
-        }
+        }        
+
+#else
+
+#error MUX_AS_CJMP is not supported
+
+#endif
+
+        return true;
     }
 
-    assert(len >= 0);
-
-    if (ret == -1)
-    {
-        // no thunks found
-        ret = len;
-    }    
-    
-    ir->clear();
-    ir->insert(ir->begin(), rv.begin(), rv.end());
-    
-    return ret;
+    return false;
 }
 
-void get_thunk_index(vector<Stmt *> *ir, int *op, int *dep1, int *dep2, int *ndep, int *mux0x)
+int del_put_thunk(bap_block_t *block, int op, int dep1, int dep2, int ndep, int mux0x)
 {
-    assert(ir);
+    assert(block);
+
+    vector<string> names;
+    vector<Stmt *> *ir = block->bap_ir;
+
+    // delete mux0x used for flag thunks
+    del_put_thunk_mux0x(block, op, names);
+    del_put_thunk_mux0x(block, dep1, names);
+    del_put_thunk_mux0x(block, dep2, names);
+    del_put_thunk_mux0x(block, ndep, names);    
+
+    names.push_back("R_CC_OP");
+    names.push_back("R_CC_DEP1");
+    names.push_back("R_CC_DEP2");
+    names.push_back("R_CC_NDEP");
+
+    // delete get thunks
+    return del_stmt(block->bap_ir, DEL_STMT_LHS, true, names);
+}
+
+void get_put_thunk(bap_block_t *block, int *op, int *dep1, int *dep2, int *ndep, int *mux0x)
+{
+    assert(block);
 
     unsigned int i;
+    vector<Stmt *> *ir = block->bap_ir;
 
     *op = -1;
 
@@ -456,33 +555,99 @@ void get_thunk_index(vector<Stmt *> *ir, int *op, int *dep1, int *dep2, int *nde
     {
         Stmt *stmt = ir->at(i);
 
-        if (stmt->stmt_type != MOVE || ((Move *)stmt)->lhs->exp_type != TEMP)
+        if (stmt->stmt_type != MOVE)
         {
             continue;
         }
 
-        Temp *temp = (Temp *)((Move *)stmt)->lhs;
+        Move *move = (Move *)stmt;
 
-        if (temp->name.find("CC_OP") != string::npos)
+        if (move->lhs->exp_type != TEMP)
         {
-            *op = i;
+            continue;
+        }
+
+        Temp *temp = (Temp *)move->lhs;
+
+        if (temp->name.find("R_CC_OP") != string::npos)
+        {
+            *op = i;            
 
             if (match_mux0x(ir, (i - MUX_SUB), NULL, NULL, NULL, NULL) >= 0)
             {
                 *mux0x = (i - MUX_SUB);
             }
         }
-        else if (temp->name.find("CC_DEP1") != string::npos)
+        else if (temp->name.find("R_CC_DEP1") != string::npos)
         {
             *dep1 = i;
         }
-        else if (temp->name.find("CC_DEP2") != string::npos)
+        else if (temp->name.find("R_CC_DEP2") != string::npos)
         {
             *dep2 = i;
         }
-        else if (temp->name.find("CC_NDEP") != string::npos)
+        else if (temp->name.find("R_CC_NDEP") != string::npos)
         {
             *ndep = i;
+        }
+    }
+}
+
+void del_get_itstate(bap_block_t *block)
+{
+    assert(block);
+
+    vector<string> names;
+
+    names.push_back("R_ITSTATE");
+
+    // delete ITSTATE operations
+    del_stmt(block->bap_ir, DEL_STMT_RHS, true, names);    
+}
+
+void del_put_itstate(bap_block_t *block, int itstate)
+{
+    assert(block);
+    
+    vector<string> names;
+
+    names.push_back("R_ITSTATE");
+
+    // delete ITSTATE operations
+    del_stmt(block->bap_ir, DEL_STMT_LHS, true, names);    
+}
+
+void get_put_itstate(bap_block_t *block, int *itstate)
+{
+    assert(block);
+
+    unsigned int i;
+    vector<Stmt *> *ir = block->bap_ir;
+
+    *itstate = -1;
+
+    // Look for occurrence of ITSTATE assignment
+    for (i = 0; i < ir->size(); i++)
+    {
+        Stmt *stmt = ir->at(i);
+
+        if (stmt->stmt_type != MOVE)
+        {
+            continue;
+        }
+
+        Move *move = (Move *)stmt;
+
+        if (move->lhs->exp_type != TEMP)
+        {
+            continue;
+        }
+
+        Temp *temp = (Temp *)move->lhs;        
+
+        if (temp->name.find("R_ITSTATE") != string::npos)
+        {
+            *itstate = i;
         }
     }
 }
@@ -674,7 +839,7 @@ reg_t regt_of_irexpr(IRSB *irbb, IRExpr *e)
 Temp *mk_temp(string name, IRType ty)
 {
     reg_t typ = IRType_to_reg_type(ty);
-    Temp *ret = new Temp(typ, "T_" + name);
+    Temp *ret = new Temp(typ, name);
     return ret;
 }
 
@@ -949,8 +1114,10 @@ Exp *translate_const(bap_context_t *context, IRExpr *expr)
         value = co->Ico.U64;
         break;
 
+    //
     // Not sure what the diff here is, VEX comments say F64 is IEEE754 floating
-    // and F64i is 64 bit unsigned int interpreted literally at IEEE754 double
+    // and F64i is 64 bit unsigned int interpreted literally at IEEE754 double.
+    //
     case Ico_F64: //  width = I64;   value.floatval = co->Ico.F64;   kind = REG_FLOAT; break;
     case Ico_F64i: // width = I64;   value.floatval = co->Ico.F64i;  kind = REG_FLOAT; break;
     
@@ -1347,6 +1514,11 @@ Exp *translate_simple_binop(bap_context_t *context, IRExpr *expr, IRSB *irbb, ve
     case Iop_CmpEQ16:
     case Iop_CmpEQ32:
     case Iop_CmpEQ64:
+
+    case Iop_CasCmpEQ8:
+    case Iop_CasCmpEQ16:
+    case Iop_CasCmpEQ32:
+    case Iop_CasCmpEQ64:
     
         return new BinOp(EQ, arg1, arg2);
     
@@ -1354,6 +1526,11 @@ Exp *translate_simple_binop(bap_context_t *context, IRExpr *expr, IRSB *irbb, ve
     case Iop_CmpNE16:
     case Iop_CmpNE32:
     case Iop_CmpNE64:
+
+    case Iop_CasCmpNE8:
+    case Iop_CasCmpNE16:
+    case Iop_CasCmpNE32:
+    case Iop_CasCmpNE64:
     
         return new BinOp(NEQ, arg1, arg2);
 
@@ -1584,8 +1761,7 @@ Exp *translate_triop(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<St
     return NULL;
 }
 
-Exp *emit_mux0x(vector<Stmt *> *irout, reg_t type,
-                Exp *cond, Exp *exp0, Exp *expX)
+Exp *emit_mux0x(vector<Stmt *> *irout, reg_t type, Exp *cond, Exp *exp0, Exp *expX)
 {
     assert(cond);
     assert(exp0);
@@ -1635,7 +1811,7 @@ Exp *emit_mux0x(vector<Stmt *> *irout, reg_t type,
                                                 new UnOp(NOT,
                                                         widened_cond)))));
 
-#else // def MUX_AS_CJMP
+#else // MUX_AS_CJMP
 
     Label *labelX = mk_label();
     Label *done = mk_label();
@@ -1703,7 +1879,27 @@ Exp *translate_load(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stm
     return mem;
 }
 
-Exp *translate_tmp_ex(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
+string translate_tmp_name(bap_context_t *context, IRType type, IRTemp tmp)
+{
+    return "T_" + int_to_str(get_type_size(IRType_to_reg_type(type))) + "t" + int_to_str(tmp);
+}
+
+string translate_tmp_name(bap_context_t *context, IRSB *irbb, IRExpr *expr, IRTemp tmp)
+{
+    IRType type = translate_tmp_type(context, irbb, expr);
+
+    return translate_tmp_name(context, type, tmp);
+}
+
+IRType translate_tmp_type(bap_context_t *context, IRSB *irbb, IRExpr *expr)
+{    
+    assert(irbb);
+    assert(expr);
+
+    return typeOfIRExpr(irbb->tyenv, expr);   
+}
+
+Exp *translate_tmp_expr(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(expr);
     assert(irbb);
@@ -1712,11 +1908,10 @@ Exp *translate_tmp_ex(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<S
     IRType type;
     string name;
 
-    type = typeOfIRExpr(irbb->tyenv, expr);
+    type = translate_tmp_type(context, irbb, expr);
+    name = translate_tmp_name(context, irbb, expr, expr->Iex.RdTmp.tmp);
 
-    name = int_to_str(get_type_size(IRType_to_reg_type(type))) + "t" + int_to_str(expr->Iex.RdTmp.tmp);
     return mk_temp(name, type);
-
 }
 
 //----------------------------------------------------------------------
@@ -1747,7 +1942,7 @@ Exp *translate_expr(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stm
         break;
     
     case Iex_RdTmp:
-        result = translate_tmp_ex(context, expr, irbb, irout);
+        result = translate_tmp_expr(context, expr, irbb, irout);
         break;
     
     case Iex_Triop:
@@ -1793,19 +1988,19 @@ Exp *translate_expr(bap_context_t *context, IRExpr *expr, IRSB *irbb, vector<Stm
     return result;
 }
 
-Stmt *translate_tmp_st(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
+Stmt *translate_tmp_stmt(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
 {
     assert(stmt);
-    assert(irbb);
     assert(irout);
 
     IRType type;
-    Exp *data;
     string name;
+    Exp *data;    
 
-    type = typeOfIRExpr(irbb->tyenv, stmt->Ist.WrTmp.data);
-    data = translate_expr(context, stmt->Ist.WrTmp.data, irbb, irout);
-    name = int_to_str(get_type_size(IRType_to_reg_type(type))) + "t" + int_to_str(stmt->Ist.WrTmp.tmp);
+    type = translate_tmp_type(context, irbb, stmt->Ist.WrTmp.data);
+    name = translate_tmp_name(context, irbb, stmt->Ist.WrTmp.data, stmt->Ist.WrTmp.tmp);
+    
+    data = translate_expr(context, stmt->Ist.WrTmp.data, irbb, irout);    
 
     return new Move(mk_temp(name, type), data);
 }
@@ -1829,6 +2024,53 @@ Stmt *translate_store(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<S
     data = translate_expr(context, stmt->Ist.Store.data, irbb, irout);
 
     return new Move(mem, data);
+}
+
+Stmt *translate_cas(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<Stmt *> *irout)
+{
+    assert(stmt);
+    assert(irbb);
+    assert(irout);    
+
+    IRType type;
+    string name;
+    Exp *dest;
+    Exp *expd;
+    Exp *data;
+    Label *t;
+    Label *f;    
+
+    if (stmt->Ist.CAS.details->dataHi || stmt->Ist.CAS.details->expdHi)
+    {
+        panic("Unexpected CAS statement");
+    }
+
+    type = translate_tmp_type(context, irbb, stmt->Ist.CAS.details->dataLo);
+    name = translate_tmp_name(context, type, stmt->Ist.CAS.details->oldLo);    
+
+    dest = translate_expr(context, stmt->Ist.CAS.details->addr, irbb, irout);    
+
+    irout->push_back(new Move(mk_temp(name, type), 
+                              new Mem(dest, IRType_to_reg_type(type))));
+
+    expd = translate_expr(context, stmt->Ist.CAS.details->expdLo, irbb, irout);    
+
+    t = mk_label();
+    f = mk_label();
+
+    irout->push_back(new CJmp(new BinOp(NEQ, mk_temp(name, type), expd), 
+                              new Name(f->label), 
+                              new Name(t->label)));    
+
+    irout->push_back(t);
+
+    dest = translate_expr(context, stmt->Ist.CAS.details->addr, irbb, irout);    
+    data = translate_expr(context, stmt->Ist.CAS.details->dataLo, irbb, irout);
+
+    irout->push_back(new Move(new Mem(dest, IRType_to_reg_type(type)), 
+                              data));    
+
+    return f;
 }
 
 Stmt *translate_imark(bap_context_t *context, IRStmt *stmt, IRSB *irbb)
@@ -1904,7 +2146,7 @@ Stmt *translate_stmt(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<St
     
     case Ist_WrTmp:
     
-        result = translate_tmp_st(context, stmt, irbb, irout);
+        result = translate_tmp_stmt(context, stmt, irbb, irout);
         break;
     
     case Ist_Store:
@@ -1913,8 +2155,8 @@ Stmt *translate_stmt(bap_context_t *context, IRStmt *stmt, IRSB *irbb, vector<St
         break;
     
     case Ist_CAS:
-    
-        result = new Special(uTag + "CAS");
+
+        result = translate_cas(context, stmt, irbb, irout);
         break;
     
     case Ist_LLSC:
@@ -2056,7 +2298,7 @@ vector<Stmt *> *translate_special(bap_context_t *context, address_t inst)
 }
 
 //----------------------------------------------------------------------
-// Generate Stmts for unknown/untranslated machine instruction
+// Generate Stmts for unknown or not translated machine instruction
 //----------------------------------------------------------------------
 vector<Stmt *> *translate_unknown(bap_context_t *context, string tag)
 {
@@ -2121,7 +2363,7 @@ vector<Stmt *> *translate_irbb(bap_context_t *context, IRSB *irbb)
         }
         catch (const char *e)
         {
-            st = new Special("Untranslated IR statement. Cause: " + string(e));
+            st = new Special("IR statement not translated, cause: " + string(e));
         }
 
         irout->push_back(st);
@@ -2136,7 +2378,7 @@ vector<Stmt *> *translate_irbb(bap_context_t *context, IRSB *irbb)
     }
     catch (const char *e)
     {
-        st = new Special("Untranslated Jump out of BB. Cause: " + string(e));
+        st = new Special("Jump out of BB not translated, cause: " + string(e));
     }
 
     if (st != NULL)
@@ -2170,7 +2412,7 @@ bap_block_t *generate_vex_ir(bap_context_t *context, uint8_t *data, address_t in
         if (context->inst_size != 0 &&
             context->inst + context->inst_size != inst)
         {
-            CC_OP_RESET(context);
+            context->flag_thunks.op = CC_OP_UNDEF;
         }
 
         context->inst = inst;
@@ -2270,14 +2512,14 @@ void insert_specials(bap_context_t *context, bap_block_t *block)
     }
 }
 
-void track_flag_thunks(bap_context_t *context, bap_block_t *block)
+void track_flags(bap_context_t *context, bap_block_t *block)
 {
     vector<Stmt *> *ir = block->bap_ir;
     int opi = -1, dep1 = -1, dep2 = -1, ndep = -1, mux0x = -1;
 
     // Look for occurrence of CC_OP assignment
     // These will have the indices of the CC_OP stmts    
-    get_thunk_index(ir, &opi, &dep1, &dep2, &ndep, &mux0x);
+    get_put_thunk(block, &opi, &dep1, &dep2, &ndep, &mux0x);
 
     if (opi == -1)        
     {
@@ -2285,18 +2527,69 @@ void track_flag_thunks(bap_context_t *context, bap_block_t *block)
         return;
     }
 
-    Stmt *op_stmt = ir->at(opi);
+    Stmt *stmt = ir->at(opi);
 
-    if (op_stmt->stmt_type == MOVE)
+    if (stmt->stmt_type == MOVE)
     {
-        Move *op_mov = (Move *)op_stmt;
+        Move *move = (Move *)stmt;
 
-        if (op_mov->rhs->exp_type == CONSTANT)
+        if (move->rhs->exp_type == CONSTANT)
         {
-            Constant *op_const = (Constant *)op_mov->rhs;
+            Constant *constant = (Constant *)move->rhs;
             
             // save CC_OP value
-            CC_OP_SET(context, op_const->val);
+            context->flag_thunks.op = constant->val;
+        }
+    }
+}
+
+void track_itstate(bap_context_t *context, bap_block_t *block)
+{
+    vector<Stmt *> *ir = block->bap_ir;
+    int n = -1;
+
+    // Look for occurrence of ITSTATE assignment
+    get_put_itstate(block, &n);
+
+    if (n == -1)        
+    {
+        // doesn't set ITSTATE
+        return;
+    }
+
+    Stmt *stmt = ir->at(n);
+
+    if (stmt->stmt_type == MOVE)
+    {
+        Move *move = (Move *)stmt;
+
+        if (move->rhs->exp_type == CONSTANT)
+        {
+            Constant *constant = (Constant *)move->rhs;
+            uint32_t itstate = (uint32_t)constant->val;
+
+            if (context->itstate != 0)
+            {
+                if (itstate != 0)
+                {
+                    panic("track_itstate(): Unexpected R_ITSTATE assignment");
+                }
+
+                // update instruction with actual ITSTATE value
+                constant->val = (uint64_t)context->itstate;
+
+                // go to the next ITSTATE lane
+                context->itstate = context->itstate >> 8;
+            }    
+            else                 
+            {
+                context->itstate = itstate;
+
+                if (itstate != 0)
+                {
+                    constant->val = 0;                    
+                }
+            }            
         }
     }
 }
@@ -2307,9 +2600,8 @@ bap_context_t *init_bap_context(VexArch guest)
 
     memset(context, 0, sizeof(bap_context_t));    
     
-    CC_OP_RESET(context);
-
     context->guest = guest; 
+    context->flag_thunks.op = CC_OP_UNDEF;    
 
     return context;
 }
@@ -2341,19 +2633,34 @@ void generate_bap_ir(bap_context_t *context, bap_block_t *block)
         insert_specials(context, block);
 
         // Track current value of CC_OP guest register
-        track_flag_thunks(context, block);
+        track_flags(context, block);
+
+        // Track current value of ITSTATE guest register
+        track_itstate(context, block);
 
         // Go through the block and add on eflags modifications
         modify_flags(context, block);
 
-        // Delete EFLAGS get thunks
-        if (!use_eflags_thunks)
+        if (context->guest == VexArchARM)
         {
+            // Replace ITSTATE assignments with proper IR code
+            arm_modify_itstate(context, block);
+
+            // Replace ITSTATE assignments with proper IR code
+            arm_modify_itstate_cond(context, block);
+        }
+
+        // Delete EFLAGS get thunks
+        if (!use_eflags_thunks && !i386_op_is_very_broken(context->guest, block->str_mnem))
+        {            
             del_get_thunk(block);
         }
 
         // Delete trash after eliminated x86g_use_seg_selector call
         del_seg_selector_trash(block);
+
+        // Delete 'Internal' statements
+        del_internal(block);
 
         // Add the asm and ir addresses
         for (int j = 0; j < vir->size(); j++)

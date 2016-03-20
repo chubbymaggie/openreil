@@ -134,6 +134,29 @@ CReilFromBilTranslator::~CReilFromBilTranslator()
 
 void CReilFromBilTranslator::reset_state(bap_block_t *block)
 {
+    vector<reil_inst_t *>::iterator it;
+
+    // cleanup translated instructions
+    for (it = translated_insts.begin(); it != translated_insts.end(); ++it)
+    {
+        reil_inst_t *reil_inst = *it;
+
+        delete reil_inst;
+    }
+
+    vector<BAP_LABEL *>::iterator it_l;
+
+    // cleanup translated labels
+    for (it_l = translated_labels.begin(); it_l != translated_labels.end(); ++it_l)
+    {
+        BAP_LABEL *label = *it_l;
+
+        delete label;
+    }
+
+    translated_insts.clear();
+    translated_labels.clear();
+
     tempreg_bap.clear();
     
     current_block = block;
@@ -267,9 +290,10 @@ reg_t CReilFromBilTranslator::convert_operand_size(reil_size_t size)
 
 void CReilFromBilTranslator::convert_operand(Exp *exp, reil_arg_t *reil_arg)
 {
+    memset(reil_arg, 0, sizeof(reil_arg_t));
+
     if (exp == NULL)
-    {
-        memset(reil_arg, 0, sizeof(reil_arg_t));
+    {        
         reil_arg->type = A_NONE;
         return;
     }
@@ -355,33 +379,29 @@ Exp *CReilFromBilTranslator::temp_operand(reg_t typ, reil_inum_t inum)
 
 void CReilFromBilTranslator::process_reil_inst(reil_inst_t *reil_inst)
 {
-    if (inst_handler)
+    if (reil_inst->inum == 0 && current_raw_info)
     {
-        address_t addr = reil_inst->raw_info.addr;
+        // first IR instruction must contain extended information about machine code
+        reil_inst->raw_info.data = current_raw_info->data;
+        reil_inst->raw_info.str_mnem = current_raw_info->str_mnem;
+        reil_inst->raw_info.str_op = current_raw_info->str_op;
+    }        
 
-        if (reil_inst->inum == 0 && current_raw_info)
-        {
-            // first IR instruction must contain extended information about machine code
-            reil_inst->raw_info.data = current_raw_info->data;
-            reil_inst->raw_info.str_mnem = current_raw_info->str_mnem;
-            reil_inst->raw_info.str_op = current_raw_info->str_op;
-        }        
+    reil_inst_t *temp = new reil_inst_t;
+    
+    memcpy(temp, reil_inst, sizeof(reil_inst_t));
 
 #ifdef CLEAR_THUMB_BIT
 
-        if (guest == VexArchARM)
-        {
-            // clear zero bit of address that used only for enabling thumb mode
-            reil_inst->raw_info.addr &= -2;
-        }
+    if (guest == VexArchARM)
+    {
+        // clear zero bit of address that used only for enabling thumb mode
+        temp->raw_info.addr &= -2;
+    }
 
 #endif
 
-        // call user-specified REIL instruction handler
-        inst_handler(reil_inst, inst_handler_context);
-
-        reil_inst->raw_info.addr = addr;
-    }
+    translated_insts.push_back(temp);
 }
 
 void CReilFromBilTranslator::free_bil_exp(Exp *exp)
@@ -516,7 +536,7 @@ void CReilFromBilTranslator::process_binop_arshift(reil_inst_t *reil_inst)
     NEW_INST(I_OR, reil_inst->inum);
     convert_operand(tmp_1, &new_inst.a);
     new_inst.b.type = A_CONST;
-    new_inst.b.size = size_dst;
+    new_inst.b.size = new_inst.a.size;
     new_inst.b.val = 0;
     convert_operand(tmp_2, &new_inst.c);
 
@@ -668,7 +688,7 @@ void CReilFromBilTranslator::process_binop_gt(reil_inst_t *reil_inst)
     process_binop_neq(&new_inst);
 
     process_reil_inst(&new_inst);
-    reil_inst->inum += 1;
+    reil_inst->inum = new_inst.inum + 1;
 
     Exp *tmp_1 = temp_operand(convert_operand_size(size_dst), reil_inst->inum);
 
@@ -705,7 +725,7 @@ void CReilFromBilTranslator::process_binop_ge(reil_inst_t *reil_inst)
     convert_operand(tmp_0, &new_inst.c);
 
     process_reil_inst(&new_inst);
-    reil_inst->inum += 1;
+    reil_inst->inum = new_inst.inum + 1;
 
     Exp *tmp_1 = temp_operand(convert_operand_size(size_dst), reil_inst->inum);
 
@@ -717,7 +737,7 @@ void CReilFromBilTranslator::process_binop_ge(reil_inst_t *reil_inst)
     process_binop_gt(&new_inst);
 
     process_reil_inst(&new_inst);
-    reil_inst->inum += 1;
+    reil_inst->inum = new_inst.inum + 1;
 
     // OR tmp_0, tmp_1, c
     reil_inst->op = I_OR;   
@@ -738,10 +758,23 @@ bool CReilFromBilTranslator::process_bil_cast(Exp *exp, reil_inst_t *reil_inst)
     case CAST_LOW:
         {
             // use low half of the value
-            reil_inst->op = I_AND;
+            Exp *tmp = temp_operand(convert_operand_size(reil_inst->a.size), reil_inst->inum);
+
+            NEW_INST(I_AND, reil_inst->inum);
+            COPY_ARG(&new_inst.a, &reil_inst->a);
+            new_inst.b.type = A_CONST;
+            new_inst.b.size = new_inst.a.size;
+            new_inst.b.val = reil_cast_mask(reil_inst->c.size);
+            convert_operand(tmp, &new_inst.c);
+
+            process_reil_inst(&new_inst);
+            reil_inst->inum += 1;
+
+            reil_inst->op = I_OR;
+            convert_operand(tmp, &reil_inst->a);
             reil_inst->b.type = A_CONST;
             reil_inst->b.size = reil_inst->a.size;
-            reil_inst->b.val = reil_cast_mask(reil_inst->c.size);
+            reil_inst->b.val = 0;
 
             return true;
         }
@@ -761,13 +794,26 @@ bool CReilFromBilTranslator::process_bil_cast(Exp *exp, reil_inst_t *reil_inst)
             process_reil_inst(&new_inst);
             reil_inst->inum += 1;
 
-            reil_inst->op = I_AND;            
-            convert_operand(tmp, &reil_inst->a);            
+            Exp *tmp_1 = temp_operand(convert_operand_size(reil_inst->a.size), reil_inst->inum);
+
+            NEW_INST(I_AND, reil_inst->inum);
+            convert_operand(tmp, &new_inst.a);       
+            new_inst.b.type = A_CONST;
+            new_inst.b.size = reil_inst->a.size;
+            new_inst.b.val = reil_cast_mask(reil_inst->c.size);
+            convert_operand(tmp_1, &new_inst.c);
+
+            process_reil_inst(&new_inst);
+            reil_inst->inum += 1;
+
+            reil_inst->op = I_OR;            
+            convert_operand(tmp_1, &reil_inst->a);       
             reil_inst->b.type = A_CONST;
             reil_inst->b.size = reil_inst->a.size;
-            reil_inst->b.val = reil_cast_mask(reil_inst->c.size);
+            reil_inst->b.val = 0;
 
             free_bil_exp(tmp);
+            free_bil_exp(tmp_1);
 
             return true;
         }
@@ -826,7 +872,7 @@ bool CReilFromBilTranslator::process_bil_cast(Exp *exp, reil_inst_t *reil_inst)
             NEW_INST(I_OR, reil_inst->inum);
             convert_operand(tmp_1, &new_inst.a);
             new_inst.b.type = A_CONST;
-            new_inst.b.size = size_dst;
+            new_inst.b.size = new_inst.a.size;
             new_inst.b.val = 0;
             convert_operand(tmp_2, &new_inst.c);
 
@@ -861,9 +907,24 @@ bool CReilFromBilTranslator::process_bil_cast(Exp *exp, reil_inst_t *reil_inst)
             process_reil_inst(&new_inst);
             reil_inst->inum += 1;
 
+            Exp *tmp_5 = temp_operand(convert_operand_size(size_dst), reil_inst->inum);
+
+            // extend value size
+            // OR src, 0, tmp_5
+            NEW_INST(I_OR, reil_inst->inum);
+            COPY_ARG(&new_inst.a, &reil_inst->a);
+            new_inst.b.type = A_CONST;
+            new_inst.b.size = new_inst.a.size;
+            new_inst.b.val = 0;
+            convert_operand(tmp_5, &new_inst.c);
+
+            process_reil_inst(&new_inst);
+            reil_inst->inum += 1;
+
             // join result with the source value
-            // OR src, tmp_4, dst
+            // OR tmp_5, tmp_4, dst
             reil_inst->op = I_OR;
+            convert_operand(tmp_5, &reil_inst->a);
             convert_operand(tmp_4, &reil_inst->b);
 
             free_bil_exp(tmp_0);
@@ -871,6 +932,7 @@ bool CReilFromBilTranslator::process_bil_cast(Exp *exp, reil_inst_t *reil_inst)
             free_bil_exp(tmp_2);
             free_bil_exp(tmp_3);
             free_bil_exp(tmp_4);
+            free_bil_exp(tmp_5);
 
             return true;
         }  
@@ -1038,7 +1100,7 @@ Exp *CReilFromBilTranslator::process_bil_inst(reil_op_t inst, uint64_t inst_flag
     }        
     else
     {
-        reil_assert(0, "invalid expression");
+        reil_assert(0, "unexpected expression");
     }
 
     // parse operand a expression
@@ -1102,7 +1164,36 @@ Exp *CReilFromBilTranslator::process_bil_inst(reil_op_t inst, uint64_t inst_flag
     // make REIL operands from BIL expressions
     convert_operand(a, &reil_inst.a);
     convert_operand(b, &reil_inst.b);
-    convert_operand(c, &reil_inst.c);
+
+    if (c && c->exp_type == NAME)
+    {
+        Name *name = (Name *)c;
+        reil_addr_t addr = 0;
+
+        reil_assert(inst == I_JCC, "unexpected label");        
+
+        memset(&reil_inst.c, 0, sizeof(reil_arg_t));        
+        reil_inst.c.type = A_LOC;
+
+        // find jump destination address by label name
+        if (get_bil_label(name->name, &addr))
+        {
+            reil_inst.c.val = addr;
+            reil_inst.c.inum = 0;
+        }
+        else
+        {
+            const char *name_str = name->name.c_str();  
+
+            reil_assert(strlen(name_str) < REIL_MAX_NAME_LEN, "label name is too long");
+
+            strcpy(reil_inst.c.name, name_str);
+        }
+    }
+    else
+    {
+        convert_operand(c, &reil_inst.c);
+    }    
 
     reil_inst.inum = inst_count;
     inst_count += 1;
@@ -1132,7 +1223,7 @@ Exp *CReilFromBilTranslator::process_bil_inst(reil_op_t inst, uint64_t inst_flag
     return c;
 }
 
-void CReilFromBilTranslator::check_cjmp_false_target(Exp *target)
+bool CReilFromBilTranslator::is_next_insn_label(Exp *target)
 {
     if (target->exp_type != NAME)
     {
@@ -1151,8 +1242,10 @@ void CReilFromBilTranslator::check_cjmp_false_target(Exp *target)
     // match next label name with the cjmp target name
     if (label->label != name->name)
     {
-        reil_assert(0, "check_cjmp_false_target(): unexpected label");   
+        return false;
     }
+
+    return true;
 }
 
 void CReilFromBilTranslator::process_bil_stmt(Stmt *s, uint64_t inst_flags)
@@ -1176,6 +1269,10 @@ void CReilFromBilTranslator::process_bil_stmt(Stmt *s, uint64_t inst_flags)
             log_write(LOG_BIL, "   // BAP label %s at %.8llx.%.2x", label->label.c_str(), 
                 label_addr, label_inum);
 
+            BAP_LABEL *temp = new BAP_LABEL(label->label, BAP_LOC(label_addr, label_inum));
+
+            translated_labels.push_back(temp);
+
             break;
         }
 
@@ -1196,34 +1293,15 @@ void CReilFromBilTranslator::process_bil_stmt(Stmt *s, uint64_t inst_flags)
 
             // jump statement
             Jmp *jmp = (Jmp *)s;
-            Exp *target = jmp->target, *target_tmp = NULL;            
-
-            if (target->exp_type == NAME)
-            {
-                Name *name = (Name *)target;
-                reil_addr_t addr = 0;
-
-                // find jump destination address by label name
-                if (!get_bil_label(name->name, &addr))
-                {
-                    reil_assert(0, "get_bil_label() fails");
-                }
-
-                target = target_tmp = new Constant(REG_32, addr);
-            }
+            Exp *target = jmp->target;            
 
             reil_assert(
-                target->exp_type == CONSTANT || target->exp_type == TEMP, 
+                target->exp_type == NAME || target->exp_type == TEMP, 
                 "Unexpected JMP target"
             );
 
             Constant cond(REG_1, 1);
             process_bil_inst(I_JCC, inst_flags, target, &cond);
-
-            if (target_tmp)
-            {
-                free_bil_exp(target_tmp);
-            }
 
             break;
         }
@@ -1232,31 +1310,32 @@ void CReilFromBilTranslator::process_bil_stmt(Stmt *s, uint64_t inst_flags)
         {            
             // conditional jump statement
             CJmp *cjmp = (CJmp *)s;
-            Exp *target = cjmp->t_target, *target_tmp = NULL;            
+            Exp *target = cjmp->t_target, *target_tmp = NULL;
             Exp *cond = cjmp->cond, *cond_tmp = NULL;            
 
-            if (target->exp_type == NAME)
-            {
-                Name *name = (Name *)target;
-                reil_addr_t addr = 0;
-
-                // find true target destination address by label name
-                if (!get_bil_label(name->name, &addr))
-                {
-                    reil_assert(0, "get_bil_label() fails");
-                }
-
-                target = target_tmp = new Constant(REG_32, addr);
-            }
-          
             if (cond->exp_type != TEMP)
             {
                 Exp *tmp = temp_operand(REG_1, inst_count);
                 cond = cond_tmp = process_bil_inst(I_STR, 0, tmp, cond);
             }
 
-            // verify that false target points to the next BAP instruction
-            check_cjmp_false_target(cjmp->f_target);
+            if (is_next_insn_label(cjmp->t_target))
+            {
+                if (is_next_insn_label(cjmp->f_target))
+                {
+                    reil_assert(0, "Unexpected CJMP target");
+                }
+
+                // swap conditional jump true and false targets
+                Exp *tmp = temp_operand(REG_1, inst_count);
+                cond = target_tmp = process_bil_inst(I_STR, 0, tmp, new UnOp(NOT, cond));
+
+                target = cjmp->f_target;
+            }
+            else
+            {
+                target = cjmp->t_target;
+            }
 
             process_bil_inst(I_JCC, inst_flags | IOPT_BB_END, target, cond);
 
@@ -1432,6 +1511,8 @@ bool CReilFromBilTranslator::get_bil_label(string name, reil_addr_t *addr)
 
     if (!strncmp(c_name, "pc_0x", 5))
     {
+        errno = 0;
+
         // get code pointer from label text
         ret = strtoll(c_name + 5, NULL, 16);
         reil_assert(errno != EINVAL, "invalid pc value");
@@ -1490,8 +1571,12 @@ bool CReilFromBilTranslator::get_bil_label(string name, reil_addr_t *addr)
                     }
                     else
                     {
-                        reil_assert(0, "labels at the middle of the BAP instruction are not implemented");
-                    }
+                        /* 
+                            Labels at the middle of the BAP instruction will be processed
+                            in process_bil().
+                        */
+                        return false;
+                    }                    
 
                     if (addr)
                     {
@@ -1584,9 +1669,10 @@ void CReilFromBilTranslator::process_bil(reil_raw_t *raw_info, bap_block_t *bloc
         }
 
         if (i < size - 1)
-        {
-            // check for the special statement that following current
+        {            
             Stmt *s_next = block->bap_ir->at(i + 1);
+
+            // check for the special statement that following current
             if (s_next->stmt_type == SPECIAL)
             {
                 Special *special = (Special *)s_next;
@@ -1594,7 +1680,7 @@ void CReilFromBilTranslator::process_bil(reil_raw_t *raw_info, bap_block_t *bloc
                 // translate special statement to the REIL instruction options
                 inst_flags |= convert_special(special);
             }
-        }   
+        }
 
         // convert statement to REIL code
         process_bil_stmt(s, inst_flags);
@@ -1608,7 +1694,57 @@ void CReilFromBilTranslator::process_bil(reil_raw_t *raw_info, bap_block_t *bloc
 
 _end:
 
+    if (inst_handler)
+    {
+        vector<reil_inst_t *>::iterator it;
+
+        // enumerate translated instructions
+        for (it = translated_insts.begin(); it != translated_insts.end(); ++it)
+        {
+            reil_inst_t *reil_inst = *it;
+
+            // check for JCC with label
+            if (reil_inst->op == I_JCC && reil_inst->c.type == A_LOC &&
+                strlen(reil_inst->c.name) > 0)
+            {
+                vector<BAP_LABEL *>::iterator it_l;
+                bool label_found = false;
+
+                // find label by name
+                for (it_l = translated_labels.begin(); it_l != translated_labels.end(); ++it_l)
+                {
+                    BAP_LABEL *label = *it_l;
+
+                    if (!strcmp(reil_inst->c.name, label->first.c_str()))
+                    {
+                        reil_inst->c.val = label->second.first;
+                        reil_inst->c.inum = label->second.second;
+
+                        memset(reil_inst->c.name, 0, MAX_REG_NAME_LEN);
+                        label_found = true;
+
+                        break;
+                    }
+                }
+
+                reil_assert(label_found, "unresolved label");                
+            }
+        }
+
+        // enumerate translated instructions
+        for (it = translated_insts.begin(); it != translated_insts.end(); ++it)
+        {
+            reil_inst_t *reil_inst = *it;
+
+            // call user-specified REIL instruction handler
+            inst_handler(reil_inst, inst_handler_context);
+        }
+    }
+
     log_write(LOG_BIL, "}");
+
+    // cleanup
+    reset_state(NULL);
 
     return;
 }

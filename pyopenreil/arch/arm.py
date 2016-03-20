@@ -12,7 +12,7 @@ ptr_len = 4
 class Registers:
 
     # flag registers
-    flags = ( 'R_N', 'R_Z', 'R_C', 'R_V', 'R_I', 'R_F' )
+    flags = ( 'R_NF', 'R_ZF', 'R_CF', 'R_VF' )
 
     # general purpose registers
     general = ( 'R_R0', 'R_R1', 'R_R2',  'R_R3',  'R_R4',  'R_R5',  'R_R6',  'R_R7', 
@@ -23,6 +23,9 @@ class Registers:
 
     # stack pointer
     sp = 'R_R13'
+
+    # link register
+    lr = 'R_R14'
 
     # accumulator
     accum = 'R_R0'
@@ -48,7 +51,9 @@ class Registers:
            ( 'R_CC_OP', U32 ), 
            ( 'R_CC_DEP1', U32 ),  
            ( 'R_CC_DEP2', U32 ),  
-           ( 'R_CC_NDEP', U32 )
+           ( 'R_CC_NDEP', U32 ),
+
+           ( 'R_ITCOND', U1 )
         )
 
 #

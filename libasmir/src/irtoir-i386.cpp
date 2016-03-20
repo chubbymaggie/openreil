@@ -2577,17 +2577,31 @@ static vector<Stmt *> mod_eflags_smul(bap_context_t *context, reg_t type, Exp *a
  * Or, put another way, a list of operations for which the eflags code
  * is COMPLETELY BROKEN.
  */
-bool i386_op_is_very_broken(string mnemonic)
+bool i386_op_is_very_broken(VexArch guest, string mnemonic)
 {
-    if (mnemonic.find("shr", 0) == 0 || 
-        mnemonic.find("sar", 0) == 0)
-    {
-        return true;
-    }
-    else
+
+#ifndef I386_BROKEN_FLAG_THUNKS
+
+    // force to delete thunks
+    return false;
+
+#else
+
+    if (guest != VexArchX86)
     {
         return false;
     }
+
+    if (mnemonic.find("shr", 0) != 0 &&
+        mnemonic.find("sar", 0) != 0)
+    {
+        return false;
+    }
+    
+    return true;
+
+#endif
+
 }
 
 void i386_modify_flags(bap_context_t *context, bap_block_t *block)
@@ -2599,7 +2613,7 @@ void i386_modify_flags(bap_context_t *context, bap_block_t *block)
 
     // Look for occurrence of CC_OP assignment
     // These will have the indices of the CC_OP stmts    
-    get_thunk_index(ir, &opi, &dep1, &dep2, &ndep, &mux0x);
+    get_put_thunk(block, &opi, &dep1, &dep2, &ndep, &mux0x);
 
     if (opi == -1)        
     {
@@ -2831,7 +2845,7 @@ void i386_modify_flags(bap_context_t *context, bap_block_t *block)
 
         if (cb)
         {
-            modify_eflags_helper(context, op_s, type, ir, num_params, cb);
+            modify_eflags_helper(context, block, op_s, type, num_params, cb);
         }        
         else
         {
@@ -2845,19 +2859,19 @@ void i386_modify_flags(bap_context_t *context, bap_block_t *block)
         // FIXME: how to figure out types?
         if (op.find("rol", 0) == 0)
         {
-            modify_eflags_helper(context, op, REG_32, ir, 3, (Mod_Func_0 *)mod_eflags_rol);
+            modify_eflags_helper(context, block, op, REG_32, 3, (Mod_Func_0 *)mod_eflags_rol);
         }
         else if (op.find("ror", 0) == 0)
         {
-            modify_eflags_helper(context, op, REG_32, ir, 3, (Mod_Func_0 *)mod_eflags_ror);
+            modify_eflags_helper(context, block, op, REG_32, 3, (Mod_Func_0 *)mod_eflags_ror);
         }
         else if (op.find("shr", 0) == 0 || op.find("sar", 0) == 0)
         {
-            modify_eflags_helper(context, op, REG_32, ir, 2, (Mod_Func_0 *)mod_eflags_shr);
+            modify_eflags_helper(context, block, op, REG_32, 2, (Mod_Func_0 *)mod_eflags_shr);
         }
         else if (op.find("shl", 0) == 0 && op.find("shld") == string::npos)
         {
-            modify_eflags_helper(context, op, REG_32, ir, 2, (Mod_Func_0 *)mod_eflags_shl);
+            modify_eflags_helper(context, block, op, REG_32, 2, (Mod_Func_0 *)mod_eflags_shl);
         }
         else 
         {

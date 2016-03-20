@@ -13,6 +13,9 @@ string to_string_inst_code(reil_op_t inst_code);
 
 typedef pair<int32_t, string> TEMPREG_BAP;
 
+typedef pair<reil_const_t, reil_inum_t> BAP_LOC;
+typedef pair<string, BAP_LOC> BAP_LABEL;
+
 class CReilTranslatorException
 {
 public:
@@ -56,7 +59,7 @@ private:
     bool get_bil_label(string name, reil_addr_t *addr);
     Stmt *get_bil_stmt(int pos);
 
-    void check_cjmp_false_target(Exp *target);
+    bool is_next_insn_label(Exp *target);
     
     void process_binop_arshift(reil_inst_t *reil_inst);
     void process_binop_neq(reil_inst_t *reil_inst);
@@ -84,6 +87,9 @@ private:
 
     reil_inst_handler_t inst_handler;
     void *inst_handler_context;
+
+    vector<reil_inst_t *> translated_insts;
+    vector<BAP_LABEL *> translated_labels;
 };
 
 class CReilTranslator

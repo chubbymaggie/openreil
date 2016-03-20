@@ -9,10 +9,26 @@ from symbolic import *
 # supported arhitectures
 from arch import x86, arm
 
+arm_thumb = lambda addr: addr | 1    
+
 # architecture constants
 ARCH_X86 = 0
 ARCH_ARM = 1
 
+# log_init() mask constants
+LOG_INFO = 0x00000001 # regular message
+LOG_WARN = 0x00000002 # error
+LOG_ERR = 0x00000004  # warning
+LOG_BIN = 0x00000008  # instruction bytes
+LOG_ASM = 0x00000010  # instruction assembly code
+LOG_VEX = 0x00000020  # instruction VEX code
+LOG_BIL = 0x00000040  # instruction BAP IL code
+
+# enable all debug messages
+LOG_ALL = 0x7fffffff
+
+# disable all debug messages
+LOG_NONE = 0
 
 LOG_MASK = None
 LOG_PATH = None
@@ -96,12 +112,14 @@ class Arg(object):
             serialized, t = t, None        
 
         self.type = A_NONE if t is None else t
-        self.size = None if size is None else size
-        self.name = None if name is None else name
-        self.val = 0L if val is None else long(val)
+        self.size, self.name, self.val = size, name, val
 
         # unserialize argument data
-        if serialized: self.unserialize(serialized)
+        if serialized: 
+
+            if not self.unserialize(serialized):
+
+                raise Error('Invalid serialized data')
 
     def __hash__(self):
 
@@ -124,10 +142,15 @@ class Arg(object):
         elif self.type == A_REG:   return mkstr(self.name)
         elif self.type == A_TEMP:  return mkstr(self.name)
         elif self.type == A_CONST: return mkstr('%x' % self.get_val())
+        elif self.type == A_LOC:   return '%x.%.2x' % self.val
 
     def get_val(self):
 
         mkval = lambda mask: long(self.val & mask)
+
+        if self.type != A_CONST:
+
+            raise Error('get_val() is available only for A_CONST')
 
         if self.size == U1:    return 0 if mkval(0x1) == 0 else 1
         elif self.size == U8:  return mkval(0xff)
@@ -147,8 +170,9 @@ class Arg(object):
     def serialize(self):
 
         if self.type == A_NONE:              return ()
-        elif self.type == A_CONST:           return self.type, self.size, self.val
-        elif self.type in [ A_REG, A_TEMP ]: return self.type, self.size, self.name        
+        elif self.type == A_CONST:           return ( self.type, self.size, self.val )
+        elif self.type in [ A_REG, A_TEMP ]: return ( self.type, self.size, self.name )
+        elif self.type == A_LOC:             return ( self.type, self.val )
 
     def unserialize(self, data):
 
@@ -160,9 +184,22 @@ class Arg(object):
 
                 return False
             
-            if self.type == A_REG: self.name = Arg_name(data)
-            elif self.type == A_TEMP: self.name = Arg_name(data)
+            if self.type == A_REG:     self.name = Arg_name(data)
+            elif self.type == A_TEMP:  self.name = Arg_name(data)
             elif self.type == A_CONST: self.val = Arg_val(data)
+            else: 
+
+                return False
+
+        elif len(data) == 2:
+
+            self.type = Arg_type(data)
+            addr, inum = Arg_loc(data)
+
+            if self.type == A_LOC: 
+
+                self.val = ( addr, inum )
+
             else: 
 
                 return False
@@ -170,8 +207,6 @@ class Arg(object):
         elif len(data) == 0:
 
             self.type = A_NONE
-            self.size = self.name = None 
-            self.val = 0L
 
         else: return False
 
@@ -202,6 +237,11 @@ class Arg(object):
 
             # constant value
             return SymConst(self.get_val(), self.size)
+
+        elif self.type == A_LOC:
+
+            # jump location
+            return SymIRAddr(*self.val)
 
         else: return None
 
@@ -381,6 +421,10 @@ class Insn(object):
 
         self.set_attr(IATTR_FLAGS, self.get_attr(IATTR_FLAGS) | val)
 
+    def del_flag(self, val):
+
+        self.set_attr(IATTR_FLAGS, self.get_attr(IATTR_FLAGS) & ~val)
+
     def has_flag(self, val):
 
         return self.get_attr(IATTR_FLAGS) & val != 0    
@@ -453,7 +497,9 @@ class Insn(object):
             # jump
             elif self.op == I_JCC:
 
-                c = c if self.c.type == A_CONST else out_state[c]
+                if not self.c.type in [ A_CONST, A_LOC ]:
+
+                    c = out_state.get(c)
 
                 if isinstance(c, SymConst):
 
@@ -517,6 +563,10 @@ class Insn(object):
         if self.op == I_JCC and self.c.type == A_CONST: 
 
             return self.IRAddr(( self.c.get_val(), 0 ))
+
+        elif self.op == I_JCC and self.c.type == A_LOC: 
+
+            return self.IRAddr(self.c.val)
 
         else:
 
@@ -896,22 +946,23 @@ class BasicBlock(InsnList):
         return self.last.next(), self.last.jcc_loc()    
 
 
-class TestBasicBlock(unittest.TestCase):
+class TestBasicBlock(unittest.TestCase):    
 
-    arch = ARCH_X86
+    def test_x86(self):       
 
-    def test(self):       
-
+        arch = ARCH_X86
         code = ( 'jne _l', 
                  'nop',
                  '_l: ret' )        
         
         # create translator
         from pyopenreil.utils import asm
-        tr = CodeStorageTranslator(asm.Reader(self.arch, code))
+        tr = CodeStorageTranslator(asm.Reader(arch, code))
 
         # translate basic block
         bb = tr.get_bb(0)
+
+        print bb
 
         # get successors
         lhs, rhs = bb.get_successors()
@@ -919,6 +970,33 @@ class TestBasicBlock(unittest.TestCase):
         # check for valid next instructions of JNE
         assert lhs == Insn.IRAddr(( tr.get_insn(( 0, 0 )).size, 0 ))
         assert rhs == Insn.IRAddr(( tr.get_insn(( 0, 0 )).size + 1, 0 ))
+
+    def test_thumb(self):
+
+        arch = ARCH_ARM
+        code = (
+            'push     {r7}',
+            'cmp      r0, #0',
+            'beq      _l',
+            'movs     r1, #1',
+            '_l: pop  {r7}',
+            'mov      pc, lr' )
+
+        # create translator
+        from pyopenreil.utils import asm
+        tr = CodeStorageTranslator(asm.Reader(arch, code, thumb = True))   
+
+        # translate basic block
+        bb = tr.get_bb(arm_thumb(0))
+
+        print bb
+
+        # get successors
+        lhs, rhs = bb.get_successors()
+
+        # check for valid next instructions of JNE
+        assert lhs == Insn.IRAddr(( 0x05, 4 ))
+        assert rhs == Insn.IRAddr(( 0x09, 0 ))
 
 
 class Func(InsnList):
@@ -1161,7 +1239,11 @@ class Graph(object):
 
     def __init__(self):
 
-        self.nodes, self.edges = {}, Set()    
+        self.reset()
+
+    def reset(self): 
+
+        self.nodes, self.edges = {}, Set()   
 
     def node(self, key):
 
@@ -1216,8 +1298,10 @@ class Graph(object):
         # cleanup input node
         edge.node_to.in_edges.remove(edge)
 
-        # delete edge
-        self.edges.remove(edge)
+        if edge in self.edges:
+
+            # delete edge
+            self.edges.remove(edge)
 
     def to_dot_file(self, path):
 
@@ -1331,6 +1415,8 @@ class CFGraphBuilder(object):
         self.arch = storage.arch
         self.storage = storage
 
+    is_thumb = lambda self, addr: self.arch == arm and (addr & 1) == 1
+
     def process_node(self, bb, state, context): 
 
         pass
@@ -1349,10 +1435,26 @@ class CFGraphBuilder(object):
             insn_list += self.get_insn(addr)
             insn = insn_list[-1]
 
-            # check for basic block end
-            if insn.has_flag(IOPT_BB_END): break
-
             addr += insn.size
+
+            # check for end of basic block end
+            if insn.has_flag(IOPT_BB_END): 
+                
+                next = insn.next_asm()
+
+                # check for thumb mode instructions
+                if self.is_thumb(insn.addr) and self.is_thumb(next):
+
+                    # check for I_JCC that used to propagate thumb enable bit
+                    if insn.op == I_JCC and insn.has_flag(IOPT_ASM_END) and \
+                       insn.a.type == A_CONST and insn.a.get_val() != 0 and \
+                       insn.c.type == A_LOC and insn.c.val == ( next, 0 ):
+
+                        # don't split this code on basic blocks
+                        insn.del_flag(IOPT_BB_END)
+                        continue
+                
+                break            
 
         return insn_list    
 
@@ -1365,7 +1467,7 @@ class CFGraphBuilder(object):
         last = inum
 
         # translate assembly basic block at given address
-        insn_list = self._get_bb(addr)        
+        insn_list = self._get_bb(addr)
 
         # split it into the IR basic blocks
         for insn in insn_list[inum:]:
@@ -1399,6 +1501,8 @@ class CFGraphBuilder(object):
 
             # query IR for basic block
             bb = self.get_bb(ir_addr)
+            assert bb is not None
+
             cfg.add_node(bb)
 
             _process_node(bb, state, context)
@@ -1538,9 +1642,9 @@ class DFGraph(Graph):
     NODE = DFGraphNode
     EDGE = DFGraphEdge
 
-    def __init__(self):
+    def reset(self):
 
-        super(DFGraph, self).__init__()
+        super(DFGraph, self).reset()
 
         self.entry_node = DFGraphEntryNode()
         self.exit_node = DFGraphExitNode()        
@@ -1560,13 +1664,14 @@ class DFGraph(Graph):
     def store(self, storage):
 
         addr_list = Set()
+
         for node in self.nodes.values() + list(self.deleted_nodes): 
 
             insn = node.item
             if insn is not None:                
 
                 # collect list of available machine instructions including deleted ones
-                addr_list = addr_list.union([ insn.addr ])
+                addr_list = addr_list.union([ insn.addr ])        
 
         for addr in addr_list:
 
@@ -1637,10 +1742,10 @@ class DFGraph(Graph):
 
     def optimize_all(self, storage = None):
 
-        # run all available optimizations        
-        self.eliminate_dead_code(storage = storage)  
+        # run all available optimizations                
         self.constant_folding(storage = storage)        
         self.eliminate_subexpressions(storage = storage)
+        self.eliminate_dead_code(storage = storage)  
         
     def constant_folding(self, storage = None):
 
@@ -1671,7 +1776,7 @@ class DFGraph(Graph):
 
             insn = node.item
 
-            if insn.op in [ I_JCC, I_STM, I_NONE, I_UNK ]: 
+            if insn.op in [ I_JCC, I_STM, I_LDM, I_NONE, I_UNK ]: 
 
                 return False
 
@@ -1749,6 +1854,8 @@ class DFGraph(Graph):
             # perform constants folding untill there will be some nodes to delete    
             if _constant_folding() == 0: break
 
+        print '*** %d nodes deleted' % len(deleted_nodes)
+
         # update global set of deleted DFG nodes
         self.deleted_nodes = self.deleted_nodes.union(deleted_nodes)
 
@@ -1784,19 +1891,18 @@ class DFGraph(Graph):
             for node in pending:    
                 
                 # direction of DFG analysis
-                backward = node.item.c.type == A_REG                           
+                backward = node.item.c.type == A_REG                                           
 
                 print 'DFG node "%s" sets value "%s" of "%s"' % \
                        (node, node.item.a, node.item.c)                
             
-                if backward:                    
+                if backward:                                        
 
                     insn = node.item
-                    
                     if insn.a.type != A_TEMP:
 
                         # don't touch instructions that modifies real CPU registers
-                        continue
+                        continue                    
 
                     for edge in node.in_edges:
 
@@ -1804,23 +1910,14 @@ class DFGraph(Graph):
                         out_edges = filter(lambda edge: edge.node_to != node,
                                            node_prev.out_edges)
 
+                        if len(out_edges) > 0:
+
+                            continue
+
                         insn_prev = node_prev.item
+
                         if insn_prev is None or \
-                           insn_prev.op == I_UNK: continue
-
-                        for edge in out_edges:
-
-                            insn_other = edge.node_to.item
-                            if insn_other is not None:
-
-                                # Propagate new value of insn_prev.c to other 
-                                # instructions that uses it.
-                                if insn_other.a.name == edge.name: insn_other.a = insn.c
-                                if insn_other.b.name == edge.name: insn_other.b = insn.c
-                                if insn_other.c.name == edge.name: insn_other.c = insn.c
-
-                            # update edge name to not break the DFG
-                            edge.name = insn.c.name                        
+                           insn_prev.op == I_UNK: continue                        
 
                         for edge in node.out_edges:
 
@@ -1849,8 +1946,8 @@ class DFGraph(Graph):
 
                         insn = node.item
                         node_next = edge.node_to
-
                         insn_next = node_next.item
+
                         if insn_next is None: continue
 
                         if insn_next.op == I_UNK:
@@ -1878,8 +1975,8 @@ class DFGraph(Graph):
 
                             insn = node.item
                             node_next = edge.node_to
-
                             insn_next = node_next.item
+
                             if insn_next is None: continue
 
                             print 'Updating arg %s of DFG node "%s" to %s' % \
@@ -1907,7 +2004,7 @@ class DFGraph(Graph):
                                 if not found: self.add_edge(edge.node_from, node_next, insn.a.name)                            
 
                         deleted += _eliminate(node)
-
+                    
             return deleted
 
         print '*** Optimizing temp registers usage...'
@@ -1915,6 +2012,8 @@ class DFGraph(Graph):
         while True:
 
             if _optimize_temp_regs() == 0: break
+
+        print '*** %d nodes deleted' % len(deleted_nodes)
 
         # update global set of deleted DFG nodes
         self.deleted_nodes = self.deleted_nodes.union(deleted_nodes)
@@ -1936,7 +2035,8 @@ class DFGraph(Graph):
             if arg is None: continue
             
             if (arg.type == A_TEMP) or \
-               (arg.type == A_REG and not keep_flags and arg.name in x86.Registers.flags):
+               (arg.type == A_REG and not keep_flags and (arg.name in x86.Registers.flags or \
+                                                          arg.name in arm.Registers.flags)):
 
                 print 'Eliminating %s that live at the end of the function...' % arg.name
                 self.del_edge(edge)        
@@ -1962,6 +2062,8 @@ class DFGraph(Graph):
 
                 # no more nodes to delete
                 break
+
+        print '*** %d nodes deleted' % len(deleted_nodes)
         
         # update global set of deleted DFG nodes
         self.deleted_nodes = self.deleted_nodes.union(deleted_nodes)
@@ -1975,6 +2077,10 @@ class DFGraphBuilder(object):
 
         self.arch = storage.arch
         self.storage = storage    
+
+    def get_insn(self, ir_addr):
+
+        return self.storage.get_insn(ir_addr) 
 
     def _process_state(self, bb, state):
 
@@ -2001,9 +2107,9 @@ class DFGraphBuilder(object):
 
         return updated
 
-    def _process_bb(self, bb, state, dfg):        
+    def _process_bb(self, bb, state, dfg, from_insn = False):
 
-        for insn in bb:
+        for insn in bb:            
 
             node = dfg.add_node(insn)
 
@@ -2041,7 +2147,7 @@ class DFGraphBuilder(object):
                 state[arg] = insn
 
         # check for end of the function
-        if bb.get_successors() == ( None, None ):
+        if from_insn or bb.get_successors() == ( None, None ):
 
             for arg_name, insn in state.items():
 
@@ -2049,6 +2155,21 @@ class DFGraphBuilder(object):
                 dfg.add_edge(dfg.add_node(insn), dfg.exit_node.key(), arg_name)
 
         return self._process_state(bb, state)
+
+    def from_insn(self, insn, state = None):
+
+        state = {} if state is None else state
+
+        dfg = DFGraph()
+        bb = BasicBlock(insn)
+
+        self._process_bb(bb, state, dfg, from_insn = True) 
+
+        return dfg
+
+    def from_addr(self, addr, state = None):
+
+        return self.from_insn(self.get_insn(addr), state = state)
 
     def traverse(self, ir_addr, state = None):                
 
@@ -2211,7 +2332,9 @@ class ReaderRaw(Reader):
     def read(self, addr, size): 
 
         if addr < self.addr or \
-           addr >= self.addr + len(self.data): return None
+           addr >= self.addr + len(self.data):
+
+            raise ReadError(addr)
 
         addr -= self.addr        
         return self.data[addr : addr + size]
@@ -2377,7 +2500,7 @@ class CodeStorageMem(CodeStorage):
     def fix_inums_and_flags(self):
 
         addr, prev, inum = None, None, 0
-        updated, deleted = [], []
+        updated, deleted, ir_addr_map = [], [], {}
 
         for insn in self:
             
@@ -2396,6 +2519,9 @@ class CodeStorageMem(CodeStorage):
 
                 deleted.append(( insn.addr, insn.inum ))
 
+                # remember old inum
+                ir_addr_map[( insn.addr, insn.inum )] = ( insn.addr, inum )
+
                 # update inum value for current instruction
                 insn.inum = inum
                 updated.append(insn.serialize())
@@ -2406,6 +2532,20 @@ class CodeStorageMem(CodeStorage):
         # commit instructions changes
         for ir_addr in deleted: self._del_insn(ir_addr)
         for insn in updated: self._put_insn(insn)
+
+        for insn in self:            
+
+            # check for I_JMP that needs to be updated
+            if insn.op != I_JCC or insn.c.type != A_LOC or \
+               insn.has_flag(IOPT_CALL) or insn.has_flag(IOPT_RET): continue
+
+            if not ir_addr_map.has_key(insn.c.val):
+
+                continue  
+
+            # update jump location value for current instruction
+            insn.c.val = ir_addr_map[insn.c.val]
+            self._put_insn(insn.serialize())
 
 
 class TestCodeStorageMem(unittest.TestCase):
@@ -2459,6 +2599,9 @@ class TestCodeStorageMem(unittest.TestCase):
 
 class CodeStorageTranslator(CodeStorage):
 
+    # validate instructions list returned by translator
+    DEBUG = True
+
     #
     # OpenREIL (as well as VEX) uses the least significant bit of 
     # address to determinate encoding mode for ARM instruction:
@@ -2467,12 +2610,14 @@ class CodeStorageTranslator(CodeStorage):
     _arm_addr_decode = lambda self, addr: ( addr & 0xfffffffffffffffe, addr & 1 )
 
     # Thumb enable helper
-    arm_thumb = lambda self, addr: addr | 1
+    arm_thumb = lambda self, addr: arm_thumb(addr)
+
+    translator_postprocess = []
 
     class CFGraphBuilderFunc(CFGraphBuilder):
 
         def process_node(self, bb, state, context):
-            
+
             self.func.add_bb(bb)
 
         def traverse(self, arch, ir_addr):
@@ -2485,7 +2630,7 @@ class CodeStorageTranslator(CodeStorage):
 
     def __init__(self, reader = None, storage = None):        
 
-        arch = None
+        arch = None        
 
         # determinate target architecture
         if reader is not None: arch = reader.arch
@@ -2499,54 +2644,311 @@ class CodeStorageTranslator(CodeStorage):
 
         self.translator = translator.Translator(arch, log_path = log_path, \
                                                       log_mask = log_mask)
-        
+
+        self.translator_postprocess = [ self._postprocess_cjmp, 
+                                        self._postprocess_xchg,
+                                        self._postprocess_unknown ]        
         self.arch = get_arch(arch)        
         self.storage = CodeStorageMem(arch) if storage is None else storage
         self.reader = reader
 
-    def translate_insn(self, data, addr):           
+    ''' is_valid_arg(), is_valid_insn() and is_valid_insn_list() methods are
+    used to validate IR instructions format. Any exception here indicates 
+    that invalid instruction was generated by libopenreil. '''
 
-        src, dst = [], []        
+    def is_valid_arg(self, arg):
 
-        # generate IR instructions
-        ret = self.translator.to_reil(data, addr = addr)        
+        _is_num = lambda item: isinstance(item, (int, long))
+        _is_str = lambda item: isinstance(item, basestring)
+        _is_tup = lambda item: isinstance(item, tuple) 
 
-        #
-        # Represent Cjmp + Jmp (libasmir artifact) as Not + Cjmp.
-        #
-        if len(ret) > 2 and \
-           Insn_op(ret[-1]) == I_JCC and \
-           Insn_op(ret[-2]) == I_JCC:
+        assert arg.size in [ None, U1, U8, U16, U32, U64 ]
 
-            jcc_1 = Insn(ret[-2])
-            jcc_2 = Insn(ret[-1])
+        if arg.type == A_REG or arg.type == A_TEMP:
+
+            assert _is_num(arg.size)
+            assert _is_str(arg.name)
+
+            if arg.type == A_REG:
+
+                assert arg.name.find('R_') == 0
+
+            elif arg.type == A_TEMP:
+
+                assert arg.name.find('V_') == 0
+
+        elif arg.type == A_CONST:
+
+            assert _is_num(arg.size)
+            assert _is_num(arg.val)
+
+        elif arg.type == A_LOC:
+
+            assert _is_tup(arg.val) and len(arg.val) == 2
+            assert _is_num(arg.val[0]) and _is_num(arg.val[1])
+
+        elif arg.type == A_NONE: pass
+
+        else: assert False
+
+    def is_valid_insn(self, insn):
+
+        _is_none = lambda arg: arg.type == A_NONE
+        _is_temp = lambda arg: arg.type == A_TEMP or arg.type == A_REG
+        _is_const = lambda arg: arg.type == A_CONST
+        _is_loc = lambda arg: arg.type == A_LOC        
+
+        # check for valid arguments
+        self.is_valid_arg(insn.a)
+        self.is_valid_arg(insn.b)
+        self.is_valid_arg(insn.c)
+
+        # check for valid arguments for each opcode
+        if insn.op == I_NONE:
+
+            assert _is_none(insn.a)
+            assert _is_none(insn.b)
+            assert _is_none(insn.c)
+
+        elif insn.op == I_UNK:
+
+            assert _is_none(insn.a) or _is_temp(insn.a)
+            assert _is_none(insn.b)
+            assert _is_none(insn.c) or _is_temp(insn.c)
+
+        elif insn.op in [ I_STR, I_LDM, I_NOT, I_NEG ]:
+
+            assert _is_temp(insn.a) or _is_const(insn.a)
+            assert _is_none(insn.b)
+            assert _is_temp(insn.c)
+
+        elif insn.op == I_STM:
+
+            assert _is_temp(insn.a) or _is_const(insn.a)
+            assert _is_none(insn.b)
+            assert _is_temp(insn.c) or _is_const(insn.c)
+
+        elif insn.op in [ I_EQ,  I_LT, \
+                          I_ADD, I_SUB, I_SHL, I_SHR, \
+                          I_MUL, I_DIV, I_MOD, I_SMUL, I_SDIV, I_SMOD, \
+                          I_AND, I_OR,  I_XOR ]:
+
+            assert _is_temp(insn.a) or _is_const(insn.a)
+            assert _is_temp(insn.b) or _is_const(insn.b)
+            assert _is_temp(insn.c) 
+
+        elif insn.op == I_JCC:
+
+            assert _is_temp(insn.a) or _is_const(insn.a)
+            assert _is_none(insn.b)
+            assert _is_temp(insn.c) or _is_loc(insn.c)
+
+        else: assert False
+        
+        # check for valid arguments size
+        if (_is_temp(insn.a) or _is_const(insn.a)) and \
+           (_is_temp(insn.b) or _is_const(insn.b)):                        
+
+            assert insn.a.size == insn.b.size
+
+            if insn.op in [ I_EQ, I_LT ]:
+
+                assert insn.c.size == U1
+
+            elif insn.op != I_OR:
+
+                assert insn.a.size == insn.b.size == insn.c.size
+
+        elif (_is_temp(insn.a) or _is_const(insn.a)):
+
+            if insn.op == I_LDM:
+
+                assert insn.a.size == U32
+                assert insn.c.size != U1
+
+            elif insn.op == I_STM:
+
+                assert insn.a.size != U1
+                assert insn.c.size == U32
+
+            elif not insn.op in [ I_JCC, I_UNK ]:
+
+                assert insn.a.size == insn.c.size
+
+    def is_valid_insn_list(self, insn_list):
+
+        first = Insn(insn_list[0])
+        last = Insn(insn_list[-1])        
+
+        # check for valid flags and attrs of first and last IR instructions
+        assert first.has_attr(IATTR_BIN) and first.has_attr(IATTR_ASM)
+        assert last.has_flag(IOPT_ASM_END)
+
+        inum = 0
+
+        for insn in insn_list:
+
+            insn = insn if isinstance(insn, Insn) else Insn(insn)
+
+            # check for valid instruction information
+            assert insn.inum == inum
+            assert insn.addr == first.addr and insn.size == first.size
+
+            # more instruction checks
+            self.is_valid_insn(insn)
+            inum += 1
+
+    def optimize(self, addr_list):
+
+        if not isinstance(addr_list, tuple) and \
+           not isinstance(addr_list, list):
+
+            addr_list = ( addr_list, )
+
+        if self.storage is not None:
+
+            for addr in addr_list:
+
+                # construct dataflow graph for given function
+                dfg = DFGraphBuilder(self).traverse(addr)
+                
+                # run optimizations
+                dfg.optimize_all(storage = self.storage)
+
+    def _postprocess_cjmp(self, addr, insn_list):
+        ''' Represent Cjmp + Jmp (libasmir artifact) as Not + Cjmp. '''
+
+        if len(insn_list) > 2 and \
+           Insn_op(insn_list[-1]) == I_JCC and \
+           Insn_op(insn_list[-2]) == I_JCC:
+
+            jcc_1 = Insn(insn_list[-2])
+            jcc_2 = Insn(insn_list[-1])
 
             if jcc_1.a.type == A_TEMP and \
-               jcc_1.c.type == A_CONST and jcc_1.c.get_val() == jcc_1.addr + jcc_1.size and \
                jcc_2.a.type == A_CONST and jcc_2.a.get_val() != 0 and \
-               jcc_2.c.type == A_CONST and jcc_2.c.get_val() != jcc_2.addr + jcc_2.size:
+               jcc_1.c.type == A_LOC and jcc_1.c.val == ( jcc_1.addr + jcc_1.size, 0 ) and \
+               jcc_2.c.type == A_LOC and jcc_2.c.val != ( jcc_2.addr + jcc_2.size, 0 ):
 
                 # allocate new temp register
                 num = int(jcc_1.a.name[2:])
                 tmp = Arg(A_TEMP, jcc_1.a.size, 'V_%.2d' % (num + 1))
 
-                ret = ret[:len(ret) - 2]
+                insn_list = insn_list[: len(insn_list) - 2]
 
-                ret.append(Insn(op = I_NOT, ir_addr = jcc_1.ir_addr(), size = jcc_1.size, 
-                                a = jcc_1.a, c = tmp).serialize())
+                insn_list.append(Insn(op = I_NOT, ir_addr = jcc_1.ir_addr(), size = jcc_1.size, 
+                                      a = jcc_1.a, c = tmp).serialize())
 
-                ret.append(Insn(op = I_JCC, ir_addr = jcc_2.ir_addr(),  size = jcc_2.size,
-                                a = tmp, c = jcc_2.c, attr = jcc_2.attr).serialize())
+                insn_list.append(Insn(op = I_JCC, ir_addr = jcc_2.ir_addr(),  size = jcc_2.size,
+                                      a = tmp, c = jcc_2.c, attr = jcc_2.attr).serialize())
 
-        #
-        # Convert untranslated instruction representation into the 
-        # single I_NONE IR instruction and save operands information
-        # into it's attributes.
-        #
+        return insn_list
+
+    def _postprocess_xchg(self, addr, insn_list):
+        ''' VEX uses loop with compare-and-swap statement to represent 
+            atomic xchg operation of x86 which is total overkill:
+
+            IRSB {
+               t2 = GET:I32(24)
+               t0 = LDle:I32(t2)
+               t1 = GET:I32(16)
+               t3 = CASle(t2::t0->t1)
+               t5 = CasCmpNE32(t3,t0)
+               if (t5) { PUT(68) = 0x1337:I32; exit-Boring }
+               PUT(16) = t0
+               PUT(68) = 0x133A:I32; exit-Boring
+            }
+
+            Here we need to convert translated REIL code to more simple form. '''        
+
+        if self.arch != x86:
+
+            return insn_list
+
+        attr = Insn_attr(insn_list[0])
+
+        # check for IR code of xchg instruction
+        if not (attr.has_key(IATTR_ASM) and attr[IATTR_ASM][0] == 'xchg'):
+
+            return insn_list
+
+        # unserialize instructions list
+        insn_list = map(lambda insn: Insn(insn), insn_list)
+
+        # build dataflow graph for single machine instruction
+        dfg = DFGraphBuilder(self).from_insn(insn_list)  
+
+        removed = []
+
+        def _cleanup():
+
+            ret = 0
+
+            for key, node in dfg.nodes.items():
+
+                remove = True
+
+                if isinstance(node, DFGraphEntryNode) or \
+                   isinstance(node, DFGraphExitNode) or \
+                   node.item.op == I_STM or node in removed:
+
+                    continue
+
+                # determinate if node can be removed from DFG
+                for edge in node.out_edges:
+
+                    if edge.node_to in removed:
+
+                        continue
+
+                    if edge.name.find('R_') == 0 or \
+                       not isinstance(edge.node_to, DFGraphExitNode):
+
+                        remove = False
+                        break
+
+                if remove:
+
+                    removed.append(node)
+                    ret += 1
+
+            return ret
+
+        # run cleanup untill new removed nodes available
+        while _cleanup() > 0: pass            
+
+        # get IR addresses of removed instructions
+        removed = map(lambda node: node.item.ir_addr(), removed)            
+
+        ret, inum = [], 0
+
+        # rebuild final instructions list
+        for insn in insn_list:
+
+            if not insn.ir_addr() in removed:
+
+                insn.inum = inum
+                inum += 1
+
+                ret.append(insn)
+
+        # copy first and last instruction attributes
+        ret[0].attr, ret[-1].attr = insn_list[0].attr, insn_list[-1].attr
+
+        # serialize instructions list back
+        return map(lambda insn: insn.serialize(), ret)
+
+    def _postprocess_unknown(self, addr, insn_list):
+        ''' Convert untranslated instruction representation into the 
+            single I_NONE IR instruction and save operands information
+            as it's attributes. '''
+
         unk_insn = Insn(I_UNK, ir_addr = ( addr, 0 ))
-        unk_insn.set_flag(IOPT_ASM_END)        
+        unk_insn.set_flag(IOPT_ASM_END)  
 
-        for insn in ret:
+        src, dst = [], []      
+
+        for insn in insn_list:
 
             if Insn_inum(insn) == 0:
 
@@ -2566,12 +2968,30 @@ class CodeStorageTranslator(CodeStorage):
 
             else:
 
-                return ret
+                return insn_list
 
         if len(src) > 0: unk_insn.set_attr(IATTR_SRC, src)
         if len(dst) > 0: unk_insn.set_attr(IATTR_DST, dst)
 
-        return [ unk_insn.serialize() ]
+        return [ unk_insn.serialize() ]    
+
+    def translate_insn(self, data, addr):        
+
+        # generate IR instructions
+        ret = self.translator.to_reil(data, addr = addr)
+        
+        # validate instructions returned by libopenreil
+        if self.DEBUG: self.is_valid_insn_list(ret)
+
+        for func in self.translator_postprocess:
+
+            # perform post-translation transformation
+            ret = func(addr, ret)
+        
+        # validate instructions after post-processing
+        if self.DEBUG: self.is_valid_insn_list(ret)
+
+        return ret
 
     def clear(self): 
 
@@ -2584,15 +3004,9 @@ class CodeStorageTranslator(CodeStorage):
     def get_insn(self, ir_addr):        
 
         ir_addr = ir_addr if isinstance(ir_addr, tuple) else (ir_addr, None)
-        addr, inum, arm_thumb = ir_addr[0], ir_addr[1], 0
+        addr, inum = ir_addr
 
-        if self.arch == arm:
-
-            # clear least significant bit of instruction address in case of ARM
-            arm_addr, arm_thumb = self._arm_addr_decode(ir_addr[0])
-            ir_addr = ( arm_addr, inum )
-
-        try:             
+        try:
 
             # query already translated IR instructions for this address
             return self.storage.get_insn(ir_addr)
@@ -2601,12 +3015,24 @@ class CodeStorageTranslator(CodeStorage):
 
             pass
 
-        mem_addr = ir_addr[0]
-        if self.reader is None: raise ReadError(mem_addr)
+        if self.arch == arm:
+
+            #
+            # We need to clear least significant bit of instruction address 
+            # in case of ARM Thumb mode.
+            #
+            real_addr, _ = self._arm_addr_decode(ir_addr[0])
+
+            ir_addr = ( real_addr, inum )   
+
+        else:     
+
+            real_addr = addr
+
+        if self.reader is None: raise ReadError(real_addr)
 
         # read instruction bytes from memory
-        data = self.reader.read_insn(mem_addr)
-        if data is None: raise ReadError(mem_addr)
+        data = self.reader.read_insn(real_addr)
 
         #
         # Translate to REIL.
@@ -2614,14 +3040,14 @@ class CodeStorageTranslator(CodeStorage):
         # a memory address with thumb enabled/disabled bit included.
         #
         ret = InsnList()
-
+        
         for insn in self.translate_insn(data, addr):
 
             # save translated instructions
             self.storage.put_insn(insn)
             ret.append(Insn(insn))
 
-        return ret
+        return ret if inum is None else ret[inum]
 
     def put_insn(self, insn_or_insn_list):
 
@@ -2798,7 +3224,6 @@ class TestArchX86(unittest.TestCase):
                  'ret' )
 
         tr = CodeStorageTranslator(asm.Reader(self.arch, code))
-
         bb = tr.get_bb(0)
 
         print bb
@@ -2806,15 +3231,31 @@ class TestArchX86(unittest.TestCase):
         # get symbolic expressions for given bb
         sym = bb.to_symbolic(temp_regs = False)
 
-        fs_base = SymVal('R_FS_BASE', U32)        
-
-        assert len(sym.state) == 6
+        fs_base = SymVal('R_FS_BASE', U32)
         
         assert sym.get(SymVal('R_EDI', U32)) == SymPtr(fs_base + SymConst(0x30, U32))
         assert sym.get(SymVal('R_ESI', U32)) == SymPtr(fs_base + SymVal('R_ECX', U32))
 
         assert sym.get(SymPtr(fs_base + SymConst(0x30, U32))) == SymVal('R_EDX', U32)
         assert sym.get(SymPtr(fs_base + SymVal('R_ECX', U32))) == SymVal('R_EDX', U32)
+
+    def test_xchg(self):
+
+        from pyopenreil.utils import asm
+
+        code = ( 'xchg dword ptr [esp], edx', 
+                 'ret' )
+
+        tr = CodeStorageTranslator(asm.Reader(self.arch, code))
+        bb = tr.get_bb(0)
+
+        print bb
+
+        # get symbolic expressions for given bb
+        sym = bb.to_symbolic(temp_regs = False)
+
+        assert sym.get(SymVal('R_EDX', U32)) == SymPtr(SymVal('R_ESP', U32))
+        assert SymPtr(SymVal('R_ESP', U32)) == sym.get(SymVal('R_EDX', U32))
 
 
 class TestArchArm(unittest.TestCase):
@@ -2825,10 +3266,56 @@ class TestArchArm(unittest.TestCase):
 
         pass
 
-    def test_asm_arm(self):
+    def _code_optimization(self, tr, addr):
+ 
+        # construct dataflow graph for given function
+        dfg = DFGraphBuilder(tr).traverse(addr)
+        
+        # run available optimizations
+        dfg.optimize_all(storage = tr.storage)  
+
+    def test_asm_thumb(self):
 
         from pyopenreil.utils import asm
 
+        code = (
+            'push    {r7}',
+            'cmp     r0, #0',
+            'ittee   eq',
+            'moveq   r1, #1', # if r0 == 0
+            'moveq   r2, #1', # if r0 == 0
+            'movne   r1, #0', # if r0 != 0
+            'movne   r2, #0', # if r0 != 0
+            'pop     {r7}',
+            'mov     pc, lr' )
+
+        reader = asm.Reader(self.arch, code, thumb = True)
+        tr = CodeStorageTranslator(reader)
+
+        print repr(reader.data)
+        print tr.get_func(arm_thumb(0))
+
+        self._code_optimization(tr, arm_thumb(0))     
+
+        print tr.get_func(arm_thumb(0))
+
+    def test_asm_arm(self):
+
+        from pyopenreil.utils import asm
+        
+        code = (
+            'push    {r7}',
+            'cmp     r0, #0',
+            'movseq  r1, #1', # if r0 == 0
+            'pop     {r7}',
+            'mov     pc, lr' )
+        
+        reader = asm.Reader(self.arch, code)
+        tr = CodeStorageTranslator(reader)   
+
+        print repr(reader.data)
+        print tr.get_func(0)
+        
         code = (
             'push    {r7}',
             'cmp     r0, #0',
@@ -2840,11 +3327,14 @@ class TestArchArm(unittest.TestCase):
             'mov     pc, lr' )
 
         reader = asm.Reader(self.arch, code)
-        tr = CodeStorageTranslator(reader)        
+        tr = CodeStorageTranslator(reader)   
 
         print repr(reader.data)
         print tr.get_func(0)
+        
+        self._code_optimization(tr, 0)        
 
+        print tr.get_func(0)
 
 if __name__ == '__main__':
 
